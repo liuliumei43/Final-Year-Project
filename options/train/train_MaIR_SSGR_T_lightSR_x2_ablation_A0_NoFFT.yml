@@ -1,0 +1,179 @@
+# Table A — A0-NoFFT: Pure Fine-Tuning Reference (no adapter, NO FFT loss)
+#
+# PURPOSE: Isolate the contribution of FFTFreqLoss from the aggressive fine-tuning recipe.
+#
+# Comparison series:
+#   Baseline (MaIR-T original)     : ~35.28 (from MaIR paper)
+#   A0-NoFFT (this)                : aggressive FT + L1 ONLY + no adapter → ?
+#   A0                             : aggressive FT + L1 + FFTFreqLoss + no adapter → 35.3177
+#   A5                             : A0 + SSGR adapter → 35.3168 (100k) / 35.3168 (200k repro)
+#
+# EXPECTED DECOMPOSITION:
+#   original baseline → A0-NoFFT    : gain from aggressive recipe alone (~+0.020)
+#   A0-NoFFT → A0                   : gain from FFTFreqLoss (~+0.010~0.018)
+#   A0 → A5                         : gain from SSGR adapter (~-0.001~+0.001)
+#
+# This experiment is KEY to the paper's analysis chapter:
+# It quantifies WHY A5 shows no gain over A0, by revealing that FFT loss
+# already provides most of the "SSGR-like" frequency supervision.
+
+name: train_MaIR_SSGR_T_lightSR_x2_ablation_A0_NoFFT
+
+model_type: MambaIRModel
+scale: 2
+num_gpu: 2
+manual_seed: 10
+find_unused_parameters: false
+
+datasets:
+  train:
+    task: SR
+    name: DIV2K
+    type: PairedImageDataset
+    dataroot_gt: /add02/users/yex/projects/2025-CVPR-MaIR/datasets/DIV2K/DIV2K_train_HR
+    dataroot_lq: /add02/users/yex/projects/2025-CVPR-MaIR/datasets/DIV2K/DIV2K_train_LR_bicubic/X2
+    filename_tmpl: '{}x2'
+    io_backend:
+      type: disk
+
+    gt_size: 256
+    use_hflip: true
+    use_rot: true
+    use_shuffle: true
+    num_worker_per_gpu: 16
+    batch_size_per_gpu: 2
+    dataset_enlarge_ratio: 800
+    prefetch_mode: ~
+
+  val_1:
+    name: Set5
+    type: PairedImageDataset
+    dataroot_gt: /add02/users/yex/projects/2025-CVPR-MaIR/datasets/SR/Test/Set5/HR
+    dataroot_lq: /add02/users/yex/projects/2025-CVPR-MaIR/datasets/SR/Test/Set5/LR_bicubic/X2
+    filename_tmpl: '{}x2'
+    io_backend:
+      type: disk
+
+  val_2:
+    name: Set14
+    type: PairedImageDataset
+    dataroot_gt: /add02/users/yex/projects/2025-CVPR-MaIR/datasets/SR/Test/Set14/HR
+    dataroot_lq: /add02/users/yex/projects/2025-CVPR-MaIR/datasets/SR/Test/Set14/LR_bicubic/X2
+    filename_tmpl: '{}x2'
+    io_backend:
+      type: disk
+
+  val_3:
+    name: B100
+    type: PairedImageDataset
+    dataroot_gt: /add02/users/yex/projects/2025-CVPR-MaIR/datasets/SR/Test/B100/HR
+    dataroot_lq: /add02/users/yex/projects/2025-CVPR-MaIR/datasets/SR/Test/B100/LR_bicubic/X2
+    filename_tmpl: '{}x2'
+    io_backend:
+      type: disk
+
+  val_4:
+    name: Urban100
+    type: PairedImageDataset
+    dataroot_gt: /add02/users/yex/projects/2025-CVPR-MaIR/datasets/SR/Test/Urban100/HR
+    dataroot_lq: /add02/users/yex/projects/2025-CVPR-MaIR/datasets/SR/Test/Urban100/LR_bicubic/X2
+    filename_tmpl: '{}x2'
+    io_backend:
+      type: disk
+
+  val_5:
+    name: Manga109
+    type: PairedImageDataset
+    dataroot_gt: /add02/users/yex/projects/2025-CVPR-MaIR/datasets/SR/Test/Manga109/HR
+    dataroot_lq: /add02/users/yex/projects/2025-CVPR-MaIR/datasets/SR/Test/Manga109/LR_bicubic/X2
+    filename_tmpl: '{}_LRBI_x2'
+    io_backend:
+      type: disk
+
+network_g:
+  type: MaIR_MLVGR
+  freeze_backbone_after_load: true
+  backbone_trainable_prefixes: ['conv_after_body', 'upsample', 'layers.0', 'layers.1', 'layers.2', 'layers.3']
+
+  # No adapters (pure fine-tuning, same as A0)
+  adapter_type: 'ssgr'
+  adapter_stages: []
+
+  upscale: 2
+  in_chans: 3
+  img_range: 1.
+  d_state: 1
+  depths: [6, 6, 6, 6]
+  embed_dim: 60
+  ssm_ratio: 1.1
+  mlp_ratio: 1.6
+  upsampler: 'pixelshuffledirect'
+  resi_connection: '1conv'
+  img_size: 64
+  dynamic_ids: false
+  scan_len: 8
+
+path:
+  pretrain_network_g: /add02/users/yex/projects/2025-CVPR-MaIR/ckpt/MaIR_T_lightSR_x2.pth
+  param_key_g: params
+  strict_load_g: false
+  resume_state: ~
+
+train:
+  ema_decay: 0.999
+  grad_clip: 0.05
+  sanitize_nonfinite_grads: true
+
+  optim_g:
+    type: Adam
+    lr: !!float 1.2e-4
+    backbone_lr_scale: 0.1
+    weight_decay: 0
+    betas: [0.9, 0.99]
+
+  scheduler:
+    type: CosineAnnealingRestartLR
+    periods: [100000]
+    restart_weights: [1]
+    eta_min: !!float 1e-7
+
+  total_iter: 100000
+  warmup_iter: 5000
+
+  # ★ ONLY L1 loss — NO FFT loss (the key diagnostic difference from A0)
+  pixel_opt:
+    type: L1Loss
+    loss_weight: 1.0
+    reduction: mean
+
+  # ★ freq_opt REMOVED — this isolates the contribution of FFT loss
+
+val:
+  val_freq: 5000
+  log_metric_freq: 5000
+  val_freq_final: 5000
+  val_milestone: 5000
+  save_img: false
+  avg_metric: psnr
+  save_best_avg: true
+  metrics:
+    psnr:
+      type: calculate_psnr
+      crop_border: 2
+      test_y_channel: true
+    ssim:
+      type: calculate_ssim
+      crop_border: 2
+      test_y_channel: true
+
+logger:
+  print_freq: 200
+  save_checkpoint_freq: 5000
+  use_tb_logger: true
+  wandb:
+    project: ~
+    resume_id: ~
+
+dist_params:
+  backend: nccl
+  port: 29536

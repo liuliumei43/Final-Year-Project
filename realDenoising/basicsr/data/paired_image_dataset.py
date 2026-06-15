@@ -73,6 +73,24 @@ class Dataset_PairedImage(data.Dataset):
                 [self.lq_folder, self.gt_folder], ['lq', 'gt'],
                 self.filename_tmpl)
 
+        max_samples = opt.get('max_samples')
+        if max_samples is not None:
+            max_samples = int(max_samples)
+            subset_mode = opt.get('subset_mode', 'first')
+            if subset_mode == 'first':
+                self.paths = self.paths[:max_samples]
+            elif subset_mode == 'random':
+                rng = random.Random(int(opt.get('subset_seed', 42)))
+                indices = list(range(len(self.paths)))
+                rng.shuffle(indices)
+                indices = sorted(indices[:max_samples])
+                self.paths = [self.paths[i] for i in indices]
+            else:
+                raise ValueError(
+                    f"Unknown subset_mode: {subset_mode}. "
+                    "Use 'first' or 'random'."
+                )
+
         if self.opt['phase'] == 'train':
             self.geometric_augs = opt['geometric_augs']
 

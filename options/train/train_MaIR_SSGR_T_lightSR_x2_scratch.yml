@@ -1,0 +1,154 @@
+# SSGR v3.0 — From-Scratch Training (500K iterations)
+#
+# Spectral-Spatial Gated Refinement: dual-domain adapter co-evolved with backbone.
+# ┌─────────────────────────────────────────────────────────────────────┐
+# │ WHY from-scratch:                                                   │
+# │   Fine-tuning ceiling ~+0.005-0.015 (backbone representations are  │
+# │   already converged to L1-optimal, adapters can only steer).        │
+# │   From-scratch lets backbone + SSGR co-evolve fresh representations │
+# │   that are natively frequency-aware → target: +0.03-0.05.          │
+# │                                                                     │
+# │ Architecture: MaIR-T backbone + 3 SSGR adapters at stages [0,1,2]  │
+# │   Spatial branch: gradient-augmented variance gate + refinement     │
+# │   Spectral branch: FFT magnitude modulation (learnable)            │
+# │   HF shortcut: per-channel high-freq residual preservation         │
+# │                                                                     │
+# │ Additional params: 3 × ~7.5K = ~22.5K (~3% of backbone)            │
+# │ Loss: L1 (primary) + FFTFreqLoss (0.03, HF preservation)           │
+# │ Schedule: matches baseline MaIR-T (MultiStep, 500K, lr=2e-4)       │
+# └─────────────────────────────────────────────────────────────────────┘
+
+name: train_MaIR_SSGR_T_lightSR_x2_scratch
+model_type: MambaIRModel
+scale: 2
+num_gpu: 2
+manual_seed: 10
+find_unused_parameters: false
+
+datasets:
+  train:
+    task: SR
+    name: DIV2K
+    type: PairedImageDataset
+    dataroot_gt: /add02/users/yex/projects/2025-CVPR-MaIR/datasets/DIV2K/DIV2K_train_HR
+    dataroot_lq: /add02/users/yex/projects/2025-CVPR-MaIR/datasets/DIV2K/DIV2K_train_LR_bicubic/X2
+    filename_tmpl: '{}x2'
+    io_backend:
+      type: disk
+
+    gt_size: 128
+    use_hflip: true
+    use_rot: true
+    use_shuffle: true
+    num_worker_per_gpu: 32
+    batch_size_per_gpu: 16
+    dataset_enlarge_ratio: 500
+    prefetch_mode: ~
+
+  val:
+    name: Urban100
+    type: PairedImageDataset
+    dataroot_gt: /add02/users/yex/projects/2025-CVPR-MaIR/datasets/SR/Test/Urban100/HR
+    dataroot_lq: /add02/users/yex/projects/2025-CVPR-MaIR/datasets/SR/Test/Urban100/LR_bicubic/X2
+    filename_tmpl: '{}x2'
+    io_backend:
+      type: disk
+
+network_g:
+  type: MaIR_MLVGR
+  # From-scratch: no pretrained weights, no freezing
+  freeze_backbone_after_load: false
+
+  # SSGR adapter: dual-domain (spatial + spectral)
+  adapter_type: 'ssgr'
+  adapter_stages: [0, 1, 2]
+  adapter_bottleneck_ratio: 2
+  adapter_var_kernel: 5
+  adapter_gate_init_bias: -3.0
+  adapter_spectral_hidden_ratio: 0.25
+  adapter_hf_shortcut_bound: 0.15
+
+  # MaIR backbone parameters (same as baseline MaIR-T)
+  upscale: 2
+  in_chans: 3
+  img_range: 1.
+  d_state: 1
+  depths: [6, 6, 6, 6]
+  embed_dim: 60
+  ssm_ratio: 1.1
+  mlp_ratio: 1.6
+  upsampler: 'pixelshuffledirect'
+  resi_connection: '1conv'
+  img_size: 64
+  dynamic_ids: false
+  batch_size: 16
+  scan_len: 8
+
+path:
+  # No pretrained weights — training from scratch
+  pretrain_network_g: ~
+  strict_load_g: true
+  resume_state: ~
+
+train:
+  ema_decay: 0.999
+  grad_clip: 0.05
+  sanitize_nonfinite_grads: true
+
+  optim_g:
+    type: Adam
+    # Same LR as baseline MaIR-T (no backbone_lr_scale needed — all from scratch)
+    lr: !!float 2e-4
+    weight_decay: 0
+    betas: [0.9, 0.99]
+
+  scheduler:
+    type: MultiStepLR
+    # Same milestones as baseline MaIR-T
+    milestones: [250000, 400000, 450000, 475000]
+    gamma: 0.5
+
+  total_iter: 500000
+  warmup_iter: 3000
+
+  # L1 pixel loss (primary)
+  pixel_opt:
+    type: L1Loss
+    loss_weight: 1.0
+    reduction: mean
+
+  # FFT frequency loss: explicit HF preservation signal
+  # Reduced weight (0.02) to avoid Set14 degradation observed in finetune.
+  # Lower gamma (1.2) for more balanced HF emphasis across all datasets.
+  freq_opt:
+    type: FFTFreqLoss
+    loss_weight: 0.02
+    use_high_freq_weight: true
+    high_freq_gamma: 1.2
+
+val:
+  val_freq: !!float 10e3
+  val_freq_final: !!float 5e3
+  val_milestone: 250000
+  save_img: false
+  metrics:
+    psnr:
+      type: calculate_psnr
+      crop_border: 2
+      test_y_channel: true
+    ssim:
+      type: calculate_ssim
+      crop_border: 2
+      test_y_channel: true
+
+logger:
+  print_freq: 200
+  save_checkpoint_freq: !!float 5e3
+  use_tb_logger: true
+  wandb:
+    project: ~
+    resume_id: ~
+
+dist_params:
+  backend: nccl
+  port: 29500

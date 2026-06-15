@@ -1,0 +1,7 @@
+name: ppt3
+rank: 1
+crop: 48,264,48,48
+tiny_path: results/test_MaIR_T_lightSR_x2_visual_Set5Set14B100/visualization/Set14/ppt3x2_tiny.png
+ssgr_path: results/test_MaIR_SSGR_T_lightSR_x2_visual_Set5Set14B100/visualization/Set14/ppt3x2_ssgr.png
+gt_path: datasets/SR/Test/Set14/HR/ppt3.png
+lq_path: datasets/SR/Test/Set14/LR_bicubic/X2/ppt3x2.png

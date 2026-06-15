@@ -1,0 +1,111 @@
+name: test_MaIR_LGFA_T_lightSR_x2_postbackbone_fusion_stage1_plus_5sets
+model_type: MambaIRModel
+scale: 2
+num_gpu: 1
+manual_seed: 10
+
+datasets:
+  test_1:
+    name: Set5
+    type: PairedImageDataset
+    dataroot_gt: /add02/users/yex/projects/2025-CVPR-MaIR/datasets/SR/Test/Set5/HR
+    dataroot_lq: /add02/users/yex/projects/2025-CVPR-MaIR/datasets/SR/Test/Set5/LR_bicubic/X2
+    filename_tmpl: '{}x2'
+    io_backend:
+      type: disk
+
+  test_2:
+    name: Set14
+    type: PairedImageDataset
+    dataroot_gt: /add02/users/yex/projects/2025-CVPR-MaIR/datasets/SR/Test/Set14/HR
+    dataroot_lq: /add02/users/yex/projects/2025-CVPR-MaIR/datasets/SR/Test/Set14/LR_bicubic/X2
+    filename_tmpl: '{}x2'
+    io_backend:
+      type: disk
+
+  test_3:
+    name: B100
+    type: PairedImageDataset
+    dataroot_gt: /add02/users/yex/projects/2025-CVPR-MaIR/datasets/SR/Test/B100/HR
+    dataroot_lq: /add02/users/yex/projects/2025-CVPR-MaIR/datasets/SR/Test/B100/LR_bicubic/X2
+    filename_tmpl: '{}x2'
+    io_backend:
+      type: disk
+
+  test_4:
+    name: Urban100
+    type: PairedImageDataset
+    dataroot_gt: /add02/users/yex/projects/2025-CVPR-MaIR/datasets/SR/Test/Urban100/HR
+    dataroot_lq: /add02/users/yex/projects/2025-CVPR-MaIR/datasets/SR/Test/Urban100/LR_bicubic/X2
+    filename_tmpl: '{}x2'
+    io_backend:
+      type: disk
+
+  test_5:
+    name: Manga109
+    type: PairedImageDataset
+    dataroot_gt: /add02/users/yex/projects/2025-CVPR-MaIR/datasets/SR/Test/Manga109/HR
+    dataroot_lq: /add02/users/yex/projects/2025-CVPR-MaIR/datasets/SR/Test/Manga109/LR_bicubic/X2
+    filename_tmpl: '{}_LRBI_x2'
+    io_backend:
+      type: disk
+
+network_g:
+  type: MaIR_LGFA
+  freeze_backbone_after_load: true
+  load_extra_modules_from_full_ckpt: true
+  backbone_trainable_prefixes: ['conv_after_body', 'upsample']
+
+  post_backbone_lgfa: true
+  post_backbone_use_cross_gated_fusion: true
+  lgfa_layers: []
+  lgfa_window_size: 8
+  lgfa_global_pool: 16
+  lgfa_hidden_ratio: 0.5
+  lgfa_gate_hidden_ratio: 0.25
+  lgfa_fusion_hidden_ratio: 0.5
+  lgfa_local_high_freq_ratio: 0.45
+  lgfa_global_high_freq_ratio: 0.2
+  lgfa_use_phase: false
+  lgfa_phase_safe_mag: 0.001
+  lgfa_res_scale_init: 0.06
+  lgfa_local_res_scale_init: 0.04
+  lgfa_global_res_scale_init: 0.02
+
+  use_refine_unit: false
+  refine_hidden_ratio: 0.5
+  refine_kernel_size: 3
+  refine_res_scale_init: 0.05
+
+  upscale: 2
+  in_chans: 3
+  img_range: 1.
+  d_state: 1
+  depths: [6, 6, 6, 6]
+  embed_dim: 60
+  ssm_ratio: 1.1
+  mlp_ratio: 1.6
+  upsampler: 'pixelshuffledirect'
+  resi_connection: '1conv'
+  img_size: 64
+  dynamic_ids: false
+  scan_len: 8
+
+path:
+  pretrain_network_g: /add02/users/yex/projects/2025-CVPR-MaIR/experiments/train_MaIR_LGFA_T_lightSR_x2_postbackbone_fusion_stage1_plus/models/net_g_10000.pth
+  param_key_g: params_ema
+  strict_load_g: false
+
+val:
+  selfensemble: false
+  save_img: false
+  suffix: stage1_plus
+  metrics:
+    psnr:
+      type: calculate_psnr
+      crop_border: 2
+      test_y_channel: true
+    ssim:
+      type: calculate_ssim
+      crop_border: 2
+      test_y_channel: true

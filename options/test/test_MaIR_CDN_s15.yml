@@ -2,7 +2,7 @@
 name: test_MaIR_CDN_s15
 model_type: MambaIRModel # MaIRPlusModel for MaIR+
 scale: 1
-num_gpu: 8
+num_gpu: 1
 manual_seed: 10
 
 datasets:
@@ -11,8 +11,8 @@ datasets:
     type: PairedImageDataset
     task: denoising_color
     noise: 15
-    dataroot_gt: /xlearning/boyun/datasets/Test/McMaster
-    dataroot_lq: /xlearning/boyun/datasets/Test/McMaster
+    dataroot_gt: /add02/users/yex/projects/2025-CVPR-MaIR/datasets/ColorDN/McMasterHQ
+    dataroot_lq: /add02/users/yex/projects/2025-CVPR-MaIR/datasets/ColorDN/McMasterHQ
     filename_tmpl: '{}'
     io_backend:
       type: disk
@@ -22,8 +22,8 @@ datasets:
     type: PairedImageDataset
     task: denoising_color
     noise: 15
-    dataroot_gt: /xlearning/boyun/datasets/Test/Kodak24
-    dataroot_lq: /xlearning/boyun/datasets/Test/Kodak24
+    dataroot_gt: /add02/users/yex/projects/2025-CVPR-MaIR/datasets/ColorDN/Kodak24HQ
+    dataroot_lq: /add02/users/yex/projects/2025-CVPR-MaIR/datasets/ColorDN/Kodak24HQ
     filename_tmpl: '{}'
     io_backend:
       type: disk
@@ -33,8 +33,8 @@ datasets:
     type: PairedImageDataset
     task: denoising_color
     noise: 15
-    dataroot_gt: /xlearning/boyun/datasets/Test/CBSD68
-    dataroot_lq: /xlearning/boyun/datasets/Test/CBSD68
+    dataroot_gt: /add02/users/yex/projects/2025-CVPR-MaIR/datasets/ColorDN/CBSD68HQ
+    dataroot_lq: /add02/users/yex/projects/2025-CVPR-MaIR/datasets/ColorDN/CBSD68HQ
     filename_tmpl: '{}'
     io_backend:
       type: disk
@@ -44,8 +44,8 @@ datasets:
     type: PairedImageDataset
     task: denoising_color
     noise: 15
-    dataroot_gt: /xlearning/boyun/datasets/Test/Urban100
-    dataroot_lq: /xlearning/boyun/datasets/Test/Urban100
+    dataroot_gt: /add02/users/yex/projects/2025-CVPR-MaIR/datasets/ColorDN/Urban100HQ
+    dataroot_lq: /add02/users/yex/projects/2025-CVPR-MaIR/datasets/ColorDN/Urban100HQ
     filename_tmpl: '{}'
     io_backend:
       type: disk
@@ -71,7 +71,7 @@ network_g:
 
 # path
 path:
-  pretrain_network_g: ckpt/MaIR_CDN_s15.pth
+  pretrain_network_g: /add02/users/yex/projects/2025-CVPR-MaIR/ckpt/MaIR_CDN_s15.pth
   strict_load_g: true
 
 # validation settings
@@ -83,8 +83,8 @@ val:
     psnr: # metric name, can be arbitrary
       type: calculate_psnr
       crop_border: 0
-      test_y_channel: true
+      test_y_channel: false
     ssim:
       type: calculate_ssim
       crop_border: 0
-      test_y_channel: true
+      test_y_channel: false

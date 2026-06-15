@@ -2,6 +2,7 @@
 import functools
 import os
 import subprocess
+import datetime
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
@@ -22,6 +23,9 @@ def _init_dist_pytorch(backend, **kwargs):
     rank = int(os.environ['RANK'])
     num_gpus = torch.cuda.device_count()
     torch.cuda.set_device(rank % num_gpus)
+    # Default timeout 30 min is too short when rank 0 runs validation
+    # (can take 30+ min). Set 2 hours to be safe.
+    kwargs.setdefault('timeout', datetime.timedelta(seconds=7200))
     dist.init_process_group(backend=backend, **kwargs)
 
 

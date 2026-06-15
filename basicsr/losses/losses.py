@@ -83,6 +83,48 @@ class MSELoss(nn.Module):
 
 
 @LOSS_REGISTRY.register()
+class YChannelMSELoss(nn.Module):
+    """Metric-aligned luminance MSE loss for SR benchmarks.
+
+    SR benchmarks in this repo report PSNR/SSIM on the Y channel after
+    cropping borders. This loss mirrors that evaluation target in training so
+    fine-tuning is pushed toward the actual reported metric instead of only RGB
+    reconstruction quality.
+    """
+
+    def __init__(self, loss_weight=1.0, reduction='mean', crop_border=0):
+        super().__init__()
+        if reduction not in ['none', 'mean', 'sum']:
+            raise ValueError(f'Unsupported reduction mode: {reduction}. Supported ones are: {_reduction_modes}')
+        self.loss_weight = float(loss_weight)
+        self.reduction = reduction
+        self.crop_border = max(int(crop_border), 0)
+
+    @staticmethod
+    def _rgb_to_y(x):
+        # Tensors are RGB in [0, 1]. The evaluation path converts RGB tensor ->
+        # BGR image -> Matlab-style BT.601 Y, which is equivalent to:
+        # Y = 16 + 65.481 R + 128.553 G + 24.966 B, then divided by 255.
+        r = x[:, 0:1, :, :]
+        g = x[:, 1:2, :, :]
+        b = x[:, 2:3, :, :]
+        y = 16.0 + 65.481 * r + 128.553 * g + 24.966 * b
+        return y / 255.0
+
+    def forward(self, pred, target, weight=None, **kwargs):
+        pred = torch.nan_to_num(pred, nan=0.0, posinf=1e4, neginf=-1e4)
+        target = torch.nan_to_num(target, nan=0.0, posinf=1e4, neginf=-1e4)
+        pred_y = self._rgb_to_y(pred)
+        target_y = self._rgb_to_y(target)
+
+        if self.crop_border > 0:
+            pred_y = pred_y[:, :, self.crop_border:-self.crop_border, self.crop_border:-self.crop_border]
+            target_y = target_y[:, :, self.crop_border:-self.crop_border, self.crop_border:-self.crop_border]
+
+        return self.loss_weight * mse_loss(pred_y, target_y, weight, reduction=self.reduction)
+
+
+@LOSS_REGISTRY.register()
 class CharbonnierLoss(nn.Module):
     """Charbonnier loss (one variant of Robust L1Loss, a differentiable
     variant of L1Loss).
@@ -117,6 +159,172 @@ class CharbonnierLoss(nn.Module):
 
 
 @LOSS_REGISTRY.register()
+class FFTFreqLoss(nn.Module):
+    """频域损失：在 FFT 幅度（及可选的高频加权）上约束 pred 与 target 一致。
+    用于配合 FFT 分支训练，避免频域分支学到噪声、促进恢复正确高频成分。
+    Args:
+        loss_weight: 损失权重，默认 0.1。
+        use_high_freq_weight: 是否对高频分量加权（超分中高频更重要），默认 True。
+        high_freq_gamma: 高频权重指数，越大越强调高频。默认 2.0。
+    """
+    def __init__(self, loss_weight=0.1, use_high_freq_weight=True, high_freq_gamma=2.0, reduction='mean'):
+        super().__init__()
+        self.loss_weight = loss_weight
+        self.use_high_freq_weight = use_high_freq_weight
+        self.high_freq_gamma = high_freq_gamma
+        self.reduction = reduction
+
+    def _get_high_freq_weight(self, H, W2, device):
+        """ 频域权重 (H, W2)，W2 为 rfft2 后频域宽度 (= W//2+1)。中心低频、外围高频。 """
+        h = torch.linspace(-1, 1, H, device=device)
+        w = torch.linspace(-1, 1, W2, device=device)
+        grid_h, grid_w = torch.meshgrid(h, w, indexing='ij')
+        r = (grid_h ** 2 + grid_w ** 2).sqrt().clamp(1e-6, 1)
+        weight = (r ** self.high_freq_gamma)
+        return weight
+
+    def forward(self, pred, target, weight=None, **kwargs):
+        """
+        pred/target: [B, C, H, W]，通常为 RGB 或 Y 通道。
+        """
+        # 2D 实 FFT，与 FFTBlock 一致
+        pred_fft = torch.fft.rfft2(pred, norm='ortho')
+        target_fft = torch.fft.rfft2(target, norm='ortho')
+        B, C, H, W2 = pred_fft.shape
+        # 幅度 L1 更稳
+        pred_mag = pred_fft.abs()
+        target_mag = target_fft.abs()
+        diff = (pred_mag - target_mag).abs()
+        if self.use_high_freq_weight:
+            w = self._get_high_freq_weight(H, W2, pred.device)
+            w = w.unsqueeze(0).unsqueeze(0)
+            diff = diff * w
+        if self.reduction == 'mean':
+            loss = diff.mean()
+        elif self.reduction == 'sum':
+            loss = diff.sum()
+        else:
+            loss = diff
+        return self.loss_weight * loss
+
+
+@LOSS_REGISTRY.register()
+class DualDomainFreqLoss(nn.Module):
+    """Amplitude-phase-wavelet-edge consistency loss for dual-domain SR."""
+
+    def __init__(self, loss_weight=1.0, amplitude_weight=1.0, phase_weight=0.5,
+                 wavelet_weight=0.5, edge_weight=0.25, use_high_freq_weight=True,
+                 high_freq_gamma=1.4, phase_safe_mag=1e-3, detail_boost=1.5,
+                 reduction='mean'):
+        super().__init__()
+        self.loss_weight = loss_weight
+        self.amplitude_weight = float(amplitude_weight)
+        self.phase_weight = float(phase_weight)
+        self.wavelet_weight = float(wavelet_weight)
+        self.edge_weight = float(edge_weight)
+        self.use_high_freq_weight = use_high_freq_weight
+        self.high_freq_gamma = float(high_freq_gamma)
+        self.phase_safe_mag = float(phase_safe_mag)
+        self.detail_boost = float(detail_boost)
+        self.reduction = reduction
+
+    def _reduce(self, tensor):
+        if self.reduction == 'mean':
+            return tensor.mean()
+        if self.reduction == 'sum':
+            return tensor.sum()
+        return tensor
+
+    def _get_high_freq_weight(self, h, w2, device, dtype):
+        hh = torch.linspace(-1, 1, h, device=device, dtype=dtype)
+        ww = torch.linspace(-1, 1, w2, device=device, dtype=dtype)
+        grid_h, grid_w = torch.meshgrid(hh, ww, indexing='ij')
+        radius = (grid_h ** 2 + grid_w ** 2).sqrt().clamp(1e-6, 1)
+        return radius ** self.high_freq_gamma
+
+    def _haar_dwt(self, x):
+        h, w = x.shape[-2:]
+        pad_h = h % 2
+        pad_w = w % 2
+        if pad_h or pad_w:
+            x = F.pad(x, (0, pad_w, 0, pad_h), mode='replicate')
+
+        x00 = x[:, :, 0::2, 0::2]
+        x01 = x[:, :, 0::2, 1::2]
+        x10 = x[:, :, 1::2, 0::2]
+        x11 = x[:, :, 1::2, 1::2]
+
+        ll = (x00 + x01 + x10 + x11) * 0.5
+        lh = (x00 - x01 + x10 - x11) * 0.5
+        hl = (x00 + x01 - x10 - x11) * 0.5
+        hh = (x00 - x01 - x10 + x11) * 0.5
+        return ll, lh, hl, hh
+
+    def _sobel(self, x):
+        dtype = x.dtype
+        device = x.device
+        kernel_x = x.new_tensor([[1, 0, -1], [2, 0, -2], [1, 0, -1]], dtype=dtype, device=device)
+        kernel_y = x.new_tensor([[1, 2, 1], [0, 0, 0], [-1, -2, -1]], dtype=dtype, device=device)
+        kernel_x = kernel_x.view(1, 1, 3, 3).repeat(x.shape[1], 1, 1, 1)
+        kernel_y = kernel_y.view(1, 1, 3, 3).repeat(x.shape[1], 1, 1, 1)
+        grad_x = F.conv2d(x, kernel_x, padding=1, groups=x.shape[1])
+        grad_y = F.conv2d(x, kernel_y, padding=1, groups=x.shape[1])
+        return grad_x, grad_y
+
+    def forward(self, pred, target, weight=None, **kwargs):
+        pred = torch.nan_to_num(pred, nan=0.0, posinf=1e4, neginf=-1e4)
+        target = torch.nan_to_num(target, nan=0.0, posinf=1e4, neginf=-1e4)
+
+        pred_fft = torch.fft.rfft2(pred, norm='ortho')
+        target_fft = torch.fft.rfft2(target, norm='ortho')
+
+        pred_abs = pred_fft.abs().clamp_min(self.phase_safe_mag)
+        target_abs = target_fft.abs().clamp_min(self.phase_safe_mag)
+
+        pred_mag = torch.log1p(pred_abs)
+        target_mag = torch.log1p(target_abs)
+        amp_diff = torch.nan_to_num((pred_mag - target_mag).abs(), nan=0.0, posinf=10.0, neginf=10.0)
+
+        pred_phase_vec = pred_fft / pred_abs
+        target_phase_vec = target_fft / target_abs
+        phase_alignment = torch.real(pred_phase_vec * torch.conj(target_phase_vec)).clamp(-1.0, 1.0)
+        phase_diff = torch.nan_to_num(1.0 - phase_alignment, nan=0.0, posinf=2.0, neginf=2.0)
+
+        if self.use_high_freq_weight:
+            freq_weight = self._get_high_freq_weight(
+                pred_mag.shape[-2], pred_mag.shape[-1], pred_mag.device, pred_mag.dtype)
+            freq_weight = freq_weight.view(1, 1, pred_mag.shape[-2], pred_mag.shape[-1])
+            amp_diff = amp_diff * freq_weight
+            phase_diff = phase_diff * freq_weight
+
+        phase_mask = ((target_fft.abs() > self.phase_safe_mag) & (pred_fft.abs() > self.phase_safe_mag)).to(phase_diff.dtype)
+        phase_loss = self._reduce(phase_diff * phase_mask)
+        amplitude_loss = self._reduce(amp_diff)
+
+        pred_ll, pred_lh, pred_hl, pred_hh = self._haar_dwt(pred)
+        target_ll, target_lh, target_hl, target_hh = self._haar_dwt(target)
+        wavelet_loss = self._reduce(torch.nan_to_num((pred_ll - target_ll).abs(), nan=0.0, posinf=10.0, neginf=10.0))
+        wavelet_loss = wavelet_loss + self.detail_boost * (
+            self._reduce(torch.nan_to_num((pred_lh - target_lh).abs(), nan=0.0, posinf=10.0, neginf=10.0)) +
+            self._reduce(torch.nan_to_num((pred_hl - target_hl).abs(), nan=0.0, posinf=10.0, neginf=10.0)) +
+            self._reduce(torch.nan_to_num((pred_hh - target_hh).abs(), nan=0.0, posinf=10.0, neginf=10.0))
+        )
+
+        pred_gx, pred_gy = self._sobel(pred)
+        target_gx, target_gy = self._sobel(target)
+        edge_loss = self._reduce(torch.nan_to_num((pred_gx - target_gx).abs(), nan=0.0, posinf=10.0, neginf=10.0))
+        edge_loss = edge_loss + self._reduce(torch.nan_to_num((pred_gy - target_gy).abs(), nan=0.0, posinf=10.0, neginf=10.0))
+
+        total = (
+            self.amplitude_weight * amplitude_loss +
+            self.phase_weight * phase_loss +
+            self.wavelet_weight * wavelet_loss +
+            self.edge_weight * edge_loss
+        )
+        return self.loss_weight * total
+
+
+@LOSS_REGISTRY.register()
 class WeightedTVLoss(L1Loss):
     """Weighted TV loss.
 
@@ -143,6 +351,276 @@ class WeightedTVLoss(L1Loss):
         loss = x_diff + y_diff
 
         return loss
+
+
+@LOSS_REGISTRY.register()
+class EdgeConsistencyLoss(nn.Module):
+    """Sobel edge consistency loss for structure-aware restoration."""
+
+    def __init__(self, loss_weight=0.02, reduction='mean'):
+        super().__init__()
+        if reduction not in ['none', 'mean', 'sum']:
+            raise ValueError(f'Unsupported reduction mode: {reduction}. Supported ones are: {_reduction_modes}')
+        self.loss_weight = loss_weight
+        self.reduction = reduction
+
+    def _sobel(self, x):
+        kernel_x = x.new_tensor([[1, 0, -1], [2, 0, -2], [1, 0, -1]])
+        kernel_y = x.new_tensor([[1, 2, 1], [0, 0, 0], [-1, -2, -1]])
+        kernel_x = kernel_x.view(1, 1, 3, 3).repeat(x.shape[1], 1, 1, 1)
+        kernel_y = kernel_y.view(1, 1, 3, 3).repeat(x.shape[1], 1, 1, 1)
+        grad_x = F.conv2d(x, kernel_x, padding=1, groups=x.shape[1])
+        grad_y = F.conv2d(x, kernel_y, padding=1, groups=x.shape[1])
+        return grad_x, grad_y
+
+    def _reduce(self, tensor):
+        if self.reduction == 'mean':
+            return tensor.mean()
+        if self.reduction == 'sum':
+            return tensor.sum()
+        return tensor
+
+    def forward(self, pred, target, weight=None, **kwargs):
+        pred = torch.nan_to_num(pred, nan=0.0, posinf=1e4, neginf=-1e4)
+        target = torch.nan_to_num(target, nan=0.0, posinf=1e4, neginf=-1e4)
+        pred_gx, pred_gy = self._sobel(pred)
+        target_gx, target_gy = self._sobel(target)
+        loss = (pred_gx - target_gx).abs() + (pred_gy - target_gy).abs()
+        return self.loss_weight * self._reduce(loss)
+
+
+@LOSS_REGISTRY.register()
+class BalancedDetailFreqLoss(nn.Module):
+    """
+    Frequency loss with explicit smooth/detail balance.
+
+    stage1_plus benefits from strong frequency supervision on Urban100-like
+    images, but that same pressure can slightly over-sharpen smoother samples.
+    This loss keeps the FFT magnitude constraint while adding:
+    1. detail-aware Sobel consistency for real edges;
+    2. smooth-region low-pass consistency to protect flat areas.
+    """
+
+    def __init__(
+        self,
+        loss_weight=0.03,
+        fft_weight=1.0,
+        edge_weight=0.3,
+        smooth_weight=0.2,
+        use_high_freq_weight=True,
+        high_freq_gamma=1.5,
+        detail_kernel_size=5,
+        smooth_kernel_size=5,
+        reduction='mean',
+    ):
+        super().__init__()
+        if reduction not in ['none', 'mean', 'sum']:
+            raise ValueError(f'Unsupported reduction mode: {reduction}. Supported ones are: {_reduction_modes}')
+
+        self.loss_weight = float(loss_weight)
+        self.fft_weight = float(fft_weight)
+        self.edge_weight = float(edge_weight)
+        self.smooth_weight = float(smooth_weight)
+        self.use_high_freq_weight = bool(use_high_freq_weight)
+        self.high_freq_gamma = float(high_freq_gamma)
+        self.detail_kernel_size = max(int(detail_kernel_size), 3)
+        if self.detail_kernel_size % 2 == 0:
+            self.detail_kernel_size += 1
+        self.smooth_kernel_size = max(int(smooth_kernel_size), 3)
+        if self.smooth_kernel_size % 2 == 0:
+            self.smooth_kernel_size += 1
+        self.reduction = reduction
+
+    def _reduce(self, tensor):
+        if self.reduction == 'mean':
+            return tensor.mean()
+        if self.reduction == 'sum':
+            return tensor.sum()
+        return tensor
+
+    def _get_high_freq_weight(self, h, w2, device, dtype):
+        hh = torch.linspace(-1, 1, h, device=device, dtype=dtype)
+        ww = torch.linspace(-1, 1, w2, device=device, dtype=dtype)
+        grid_h, grid_w = torch.meshgrid(hh, ww, indexing='ij')
+        radius = (grid_h ** 2 + grid_w ** 2).sqrt().clamp(1e-6, 1)
+        return radius ** self.high_freq_gamma
+
+    def _detail_prior(self, x):
+        smooth = F.avg_pool2d(
+            x,
+            kernel_size=self.detail_kernel_size,
+            stride=1,
+            padding=self.detail_kernel_size // 2,
+        )
+        return (x - smooth).abs()
+
+    def _lowpass(self, x):
+        return F.avg_pool2d(
+            x,
+            kernel_size=self.smooth_kernel_size,
+            stride=1,
+            padding=self.smooth_kernel_size // 2,
+        )
+
+    def _sobel(self, x):
+        kernel_x = x.new_tensor([[1, 0, -1], [2, 0, -2], [1, 0, -1]])
+        kernel_y = x.new_tensor([[1, 2, 1], [0, 0, 0], [-1, -2, -1]])
+        kernel_x = kernel_x.view(1, 1, 3, 3).repeat(x.shape[1], 1, 1, 1)
+        kernel_y = kernel_y.view(1, 1, 3, 3).repeat(x.shape[1], 1, 1, 1)
+        grad_x = F.conv2d(x, kernel_x, padding=1, groups=x.shape[1])
+        grad_y = F.conv2d(x, kernel_y, padding=1, groups=x.shape[1])
+        return grad_x, grad_y
+
+    def forward(self, pred, target, weight=None, **kwargs):
+        pred = torch.nan_to_num(pred, nan=0.0, posinf=1e4, neginf=-1e4)
+        target = torch.nan_to_num(target, nan=0.0, posinf=1e4, neginf=-1e4)
+
+        pred_fft = torch.fft.rfft2(pred, norm='ortho')
+        target_fft = torch.fft.rfft2(target, norm='ortho')
+        fft_diff = (pred_fft.abs() - target_fft.abs()).abs()
+        if self.use_high_freq_weight:
+            freq_weight = self._get_high_freq_weight(
+                fft_diff.shape[-2], fft_diff.shape[-1], fft_diff.device, fft_diff.dtype
+            )
+            fft_diff = fft_diff * freq_weight.view(1, 1, fft_diff.shape[-2], fft_diff.shape[-1])
+        fft_loss = self._reduce(fft_diff)
+
+        detail = self._detail_prior(target)
+        detail_norm = detail / (detail.mean(dim=(2, 3), keepdim=True) + 1e-6)
+        detail_mask = detail_norm / (detail_norm + 1.0)
+        smooth_mask = 1.0 - detail_mask
+
+        pred_gx, pred_gy = self._sobel(pred)
+        target_gx, target_gy = self._sobel(target)
+        edge_diff = (pred_gx - target_gx).abs() + (pred_gy - target_gy).abs()
+        edge_loss = self._reduce(edge_diff * (0.5 + detail_mask))
+
+        smooth_pred = self._lowpass(pred)
+        smooth_target = self._lowpass(target)
+        smooth_diff = (smooth_pred - smooth_target).abs()
+        smooth_loss = self._reduce(smooth_diff * (0.5 + smooth_mask))
+
+        total = self.fft_weight * fft_loss
+        total = total + self.edge_weight * edge_loss
+        total = total + self.smooth_weight * smooth_loss
+        return self.loss_weight * total
+
+
+@LOSS_REGISTRY.register()
+class TeacherSelectiveConsistencyLoss(nn.Module):
+    """
+    Selective teacher distillation for SR.
+
+    The teacher only supervises regions where it is closer to GT than the
+    current student, with extra emphasis on line/tone-rich areas. This is meant
+    to preserve a strong student carrier (e.g. Urban100 gains) while borrowing
+    teacher strengths on Manga-like structures.
+    """
+
+    def __init__(
+        self,
+        loss_weight=0.03,
+        tone_weight=1.0,
+        line_weight=0.5,
+        reliability_temperature=0.02,
+        detail_kernel_size=5,
+        variance_kernel_size=5,
+        reduction='mean',
+    ):
+        super().__init__()
+        if reduction not in ['none', 'mean', 'sum']:
+            raise ValueError(f'Unsupported reduction mode: {reduction}. Supported ones are: {_reduction_modes}')
+        self.loss_weight = float(loss_weight)
+        self.tone_weight = float(tone_weight)
+        self.line_weight = float(line_weight)
+        self.reliability_temperature = max(float(reliability_temperature), 1e-6)
+        self.detail_kernel_size = max(int(detail_kernel_size), 3)
+        if self.detail_kernel_size % 2 == 0:
+            self.detail_kernel_size += 1
+        self.variance_kernel_size = max(int(variance_kernel_size), 3)
+        if self.variance_kernel_size % 2 == 0:
+            self.variance_kernel_size += 1
+        self.reduction = reduction
+
+    def _reduce(self, tensor):
+        if self.reduction == 'mean':
+            return tensor.mean()
+        if self.reduction == 'sum':
+            return tensor.sum()
+        return tensor
+
+    @staticmethod
+    def _rgb_to_y(x):
+        r = x[:, 0:1, :, :]
+        g = x[:, 1:2, :, :]
+        b = x[:, 2:3, :, :]
+        y = 16.0 + 65.481 * r + 128.553 * g + 24.966 * b
+        return y / 255.0
+
+    def _detail_prior(self, x):
+        smooth = F.avg_pool2d(
+            x,
+            kernel_size=self.detail_kernel_size,
+            stride=1,
+            padding=self.detail_kernel_size // 2,
+        )
+        return x - smooth
+
+    def _local_variance(self, x):
+        mean = F.avg_pool2d(
+            x,
+            kernel_size=self.variance_kernel_size,
+            stride=1,
+            padding=self.variance_kernel_size // 2,
+        )
+        mean_sq = F.avg_pool2d(
+            x * x,
+            kernel_size=self.variance_kernel_size,
+            stride=1,
+            padding=self.variance_kernel_size // 2,
+        )
+        return (mean_sq - mean * mean).clamp_min(0.0)
+
+    def _sobel(self, x):
+        kernel_x = x.new_tensor([[1, 0, -1], [2, 0, -2], [1, 0, -1]])
+        kernel_y = x.new_tensor([[1, 2, 1], [0, 0, 0], [-1, -2, -1]])
+        kernel_x = kernel_x.view(1, 1, 3, 3).repeat(x.shape[1], 1, 1, 1)
+        kernel_y = kernel_y.view(1, 1, 3, 3).repeat(x.shape[1], 1, 1, 1)
+        grad_x = F.conv2d(x, kernel_x, padding=1, groups=x.shape[1])
+        grad_y = F.conv2d(x, kernel_y, padding=1, groups=x.shape[1])
+        return grad_x, grad_y
+
+    @staticmethod
+    def _normalize_mask(x):
+        x = x / (x.mean(dim=(2, 3), keepdim=True) + 1e-6)
+        return x / (x + 1.0)
+
+    def forward(self, pred, teacher, weight=None, gt=None, **kwargs):
+        if gt is None:
+            raise ValueError('TeacherSelectiveConsistencyLoss requires gt=... in forward().')
+
+        pred = torch.nan_to_num(pred, nan=0.0, posinf=1e4, neginf=-1e4)
+        teacher = torch.nan_to_num(teacher, nan=0.0, posinf=1e4, neginf=-1e4)
+        gt = torch.nan_to_num(gt, nan=0.0, posinf=1e4, neginf=-1e4)
+
+        pred_y = self._rgb_to_y(pred)
+        teacher_y = self._rgb_to_y(teacher)
+        gt_y = self._rgb_to_y(gt)
+
+        tone_mask = self._normalize_mask(self._detail_prior(gt_y).abs() + self._local_variance(gt_y))
+        grad_x, grad_y = self._sobel(gt_y)
+        line_mask = self._normalize_mask(grad_x.abs() + grad_y.abs())
+
+        pred_err = (pred_y.detach() - gt_y).abs()
+        teacher_err = (teacher_y.detach() - gt_y).abs()
+        reliability = torch.sigmoid((pred_err - teacher_err) / self.reliability_temperature)
+
+        guide = (self.tone_weight * tone_mask + self.line_weight * line_mask)
+        guide = guide / max(self.tone_weight + self.line_weight, 1e-6)
+        guide = reliability * guide
+
+        distill = torch.sqrt((pred - teacher) ** 2 + 1e-12).mean(dim=1, keepdim=True)
+        return self.loss_weight * self._reduce(distill * guide)
 
 
 # @LOSS_REGISTRY.register()

@@ -5,7 +5,10 @@ import torch.utils.checkpoint as checkpoint
 import torch.nn.functional as F
 from functools import partial
 from typing import Callable
-from timm.models.layers import DropPath, to_2tuple, trunc_normal_
+try:
+    from timm.layers import DropPath, to_2tuple, trunc_normal_
+except ImportError:
+    from timm.models.layers import DropPath, to_2tuple, trunc_normal_
 from mamba_ssm.ops.selective_scan_interface import selective_scan_fn
 from einops import repeat
 

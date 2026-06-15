@@ -1,0 +1,89 @@
+name: test_MaIR_CDN_s15_ppt
+model_type: MambaIRModel
+scale: 1
+num_gpu: 1
+manual_seed: 10
+
+datasets:
+  test_1:
+    name: McMaster
+    type: PairedImageDataset
+    task: denoising_color
+    noise: 15
+    dataroot_gt: /add02/users/yex/projects/2025-CVPR-MaIR/datasets/ColorDN/McMasterHQ
+    dataroot_lq: /add02/users/yex/projects/2025-CVPR-MaIR/datasets/ColorDN/McMasterHQ
+    filename_tmpl: '{}'
+    io_backend:
+      type: disk
+
+  test_2:
+    name: Kodak24
+    type: PairedImageDataset
+    task: denoising_color
+    noise: 15
+    dataroot_gt: /add02/users/yex/projects/2025-CVPR-MaIR/datasets/ColorDN/Kodak24HQ
+    dataroot_lq: /add02/users/yex/projects/2025-CVPR-MaIR/datasets/ColorDN/Kodak24HQ
+    filename_tmpl: '{}'
+    io_backend:
+      type: disk
+
+  test_3:
+    name: CBSD68
+    type: PairedImageDataset
+    task: denoising_color
+    noise: 15
+    dataroot_gt: /add02/users/yex/projects/2025-CVPR-MaIR/datasets/ColorDN/CBSD68HQ
+    dataroot_lq: /add02/users/yex/projects/2025-CVPR-MaIR/datasets/ColorDN/CBSD68HQ
+    filename_tmpl: '{}'
+    io_backend:
+      type: disk
+
+  test_4:
+    name: Urban100
+    type: PairedImageDataset
+    task: denoising_color
+    noise: 15
+    dataroot_gt: /add02/users/yex/projects/2025-CVPR-MaIR/datasets/ColorDN/Urban100HQ
+    dataroot_lq: /add02/users/yex/projects/2025-CVPR-MaIR/datasets/ColorDN/Urban100HQ
+    filename_tmpl: '{}'
+    io_backend:
+      type: disk
+
+network_g:
+  type: MaIR
+  upscale: 1
+  in_chans: 3
+  img_range: 1.
+  d_state: 16
+  depths: [6, 6, 6, 6, 6, 6]
+  embed_dim: 180
+  ssm_ratio: 1.3
+  mlp_ratio: 2.0
+  upsampler: ~
+  resi_connection: '1conv'
+  img_size: 128
+  dynamic_ids: false
+  batch_size: 1
+  scan_len: 4
+
+path:
+  pretrain_network_g: /add02/users/yex/projects/2025-CVPR-MaIR/ckpt/MaIR_CDN_s15.pth
+  strict_load_g: true
+
+val:
+  save_img: true
+  save_lq: true
+  save_gt: true
+  save_compare: true
+  max_num_images: 5
+  pbar: true
+  suffix: baseline_ppt
+  metrics:
+    psnr:
+      type: calculate_psnr
+      crop_border: 0
+      test_y_channel: false
+    ssim:
+      type: calculate_ssim
+      crop_border: 0
+      test_y_channel: false

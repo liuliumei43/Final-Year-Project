@@ -1,0 +1,190 @@
+# SSGR v3.0 — Aggressive Fine-Tune (200K iterations)
+#
+# Full backbone unfreeze + larger patches + longer training.
+# ┌─────────────────────────────────────────────────────────────────────┐
+# │ Key changes vs conservative finetune (80K):                        │
+# │   1. backbone_lr_scale: 0.01 → 0.1  (10x more backbone update)    │
+# │   2. gt_size: 192 → 256  (larger receptive field per patch)        │
+# │   3. total_iter: 80K → 200K  (longer convergence window)           │
+# │   4. batch_size: 4 → 2  (memory budget for 256 patches)            │
+# │   5. FFT loss: 0.02/1.2  (safer params from scratch config)        │
+# │   6. warmup: 2K → 5K  (longer warmup for aggressive unfreeze)     │
+# │                                                                     │
+# │ Target: Avg PSNR +0.02~0.03 over baseline (35.2973)                │
+# │ Rationale: Higher backbone LR lets pretrained features adapt more  │
+# │ deeply; larger patches give adapters + backbone more spatial        │
+# │ context for structure-aware refinement; longer schedule lets the    │
+# │ cosine anneal reach full convergence.                               │
+# └─────────────────────────────────────────────────────────────────────┘
+
+name: train_MaIR_SSGR_S_lightSR_x2_finetune_aggressive
+model_type: MambaIRModel
+scale: 2
+num_gpu: 2
+manual_seed: 10
+find_unused_parameters: false
+
+datasets:
+  train:
+    task: SR
+    name: DIV2K
+    type: PairedImageDataset
+    dataroot_gt: /add02/users/yex/projects/2025-CVPR-MaIR/datasets/DIV2K/DIV2K_train_HR
+    dataroot_lq: /add02/users/yex/projects/2025-CVPR-MaIR/datasets/DIV2K/DIV2K_train_LR_bicubic/X2
+    filename_tmpl: '{}x2'
+    io_backend:
+      type: disk
+
+    gt_size: 256
+    use_hflip: true
+    use_rot: true
+    use_shuffle: true
+    num_worker_per_gpu: 16
+    batch_size_per_gpu: 2
+    dataset_enlarge_ratio: 800
+    prefetch_mode: ~
+
+  val_1:
+    name: Set5
+    type: PairedImageDataset
+    dataroot_gt: /add02/users/yex/projects/2025-CVPR-MaIR/datasets/SR/Test/Set5/HR
+    dataroot_lq: /add02/users/yex/projects/2025-CVPR-MaIR/datasets/SR/Test/Set5/LR_bicubic/X2
+    filename_tmpl: '{}x2'
+    io_backend:
+      type: disk
+
+  val_2:
+    name: Set14
+    type: PairedImageDataset
+    dataroot_gt: /add02/users/yex/projects/2025-CVPR-MaIR/datasets/SR/Test/Set14/HR
+    dataroot_lq: /add02/users/yex/projects/2025-CVPR-MaIR/datasets/SR/Test/Set14/LR_bicubic/X2
+    filename_tmpl: '{}x2'
+    io_backend:
+      type: disk
+
+  val_3:
+    name: B100
+    type: PairedImageDataset
+    dataroot_gt: /add02/users/yex/projects/2025-CVPR-MaIR/datasets/SR/Test/B100/HR
+    dataroot_lq: /add02/users/yex/projects/2025-CVPR-MaIR/datasets/SR/Test/B100/LR_bicubic/X2
+    filename_tmpl: '{}x2'
+    io_backend:
+      type: disk
+
+  val_4:
+    name: Urban100
+    type: PairedImageDataset
+    dataroot_gt: /add02/users/yex/projects/2025-CVPR-MaIR/datasets/SR/Test/Urban100/HR
+    dataroot_lq: /add02/users/yex/projects/2025-CVPR-MaIR/datasets/SR/Test/Urban100/LR_bicubic/X2
+    filename_tmpl: '{}x2'
+    io_backend:
+      type: disk
+
+  val_5:
+    name: Manga109
+    type: PairedImageDataset
+    dataroot_gt: /add02/users/yex/projects/2025-CVPR-MaIR/datasets/SR/Test/Manga109/HR
+    dataroot_lq: /add02/users/yex/projects/2025-CVPR-MaIR/datasets/SR/Test/Manga109/LR_bicubic/X2
+    filename_tmpl: '{}_LRBI_x2'
+    io_backend:
+      type: disk
+
+network_g:
+  type: MaIR_MLVGR
+  freeze_backbone_after_load: true
+  # Full backbone unfreeze (all 4 layers) — same as conservative finetune
+  backbone_trainable_prefixes: ['conv_after_body', 'upsample', 'layers.0', 'layers.1', 'layers.2', 'layers.3']
+
+  # SSGR adapter: dual-domain (spatial + spectral)
+  adapter_type: 'ssgr'
+  adapter_stages: [0, 1, 2]
+  adapter_bottleneck_ratio: 2
+  adapter_var_kernel: 5
+  adapter_gate_init_bias: -3.0
+  adapter_spectral_hidden_ratio: 0.25
+  adapter_hf_shortcut_bound: 0.15
+
+  # MaIR-S backbone parameters (Small model)
+  upscale: 2
+  in_chans: 3
+  img_range: 1.
+  d_state: 16
+  depths: [6, 6, 6, 6]
+  embed_dim: 60
+  ssm_ratio: 1.4
+  mlp_ratio: 1.6
+  upsampler: 'pixelshuffledirect'
+  resi_connection: '1conv'
+  img_size: 64
+  dynamic_ids: false
+  scan_len: 4
+
+path:
+  pretrain_network_g: /add02/users/yex/projects/2025-CVPR-MaIR/ckpt/MaIR_S_lightSR_x2 (1).pth
+  param_key_g: params
+  strict_load_g: false
+  resume_state: /add02/users/yex/projects/2025-CVPR-MaIR/experiments/train_MaIR_SSGR_S_lightSR_x2_finetune_aggressive/training_states/4000.state
+train:
+  ema_decay: 0.999
+  grad_clip: 0.05
+  sanitize_nonfinite_grads: true
+
+  optim_g:
+    type: Adam
+    lr: !!float 1.2e-4
+    # Aggressive backbone LR: 0.1x = 1.2e-5 (10x higher than conservative)
+    backbone_lr_scale: 0.1
+    weight_decay: 0
+    betas: [0.9, 0.99]
+
+  scheduler:
+    type: CosineAnnealingRestartLR
+    periods: [200000]
+    restart_weights: [1]
+    eta_min: !!float 1e-7
+
+  total_iter: 200000
+  warmup_iter: 5000
+
+  # L1 pixel loss (primary)
+  pixel_opt:
+    type: L1Loss
+    loss_weight: 1.0
+    reduction: mean
+
+  # FFT frequency loss (safer params from scratch config)
+  freq_opt:
+    type: FFTFreqLoss
+    loss_weight: 0.02
+    use_high_freq_weight: true
+    high_freq_gamma: 1.2
+
+val:
+  val_freq: 1000
+  log_metric_freq: 1000
+  val_freq_final: 1000
+  val_milestone: 1000
+  save_img: false
+  avg_metric: psnr
+  save_best_avg: true
+  metrics:
+    psnr:
+      type: calculate_psnr
+      crop_border: 2
+      test_y_channel: true
+    ssim:
+      type: calculate_ssim
+      crop_border: 2
+      test_y_channel: true
+
+logger:
+  print_freq: 200
+  save_checkpoint_freq: 1000
+  use_tb_logger: true
+  wandb:
+    project: ~
+    resume_id: ~
+
+dist_params:
+  backend: nccl
+  port: 29506

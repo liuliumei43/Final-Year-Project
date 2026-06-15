@@ -1,0 +1,74 @@
+# GoPro random-50 subset test for MaIRUNet + SSGR Deblur.
+# Compare only with test_MaIR_MotionDeblur_GoPro50.yml.
+
+name: test_MaIRUNet_SSGR_Deblur_GoProRandom50
+model_type: ImageCleanModel
+scale: 1
+num_gpu: 1
+manual_seed: 100
+
+datasets:
+  test_1:
+    name: GoPro-Test-Random50
+    type: Dataset_PairedImage
+    dataroot_gt: /add02/users/yex/projects/2025-CVPR-MaIR/datasets/GoPro/test/target.lmdb
+    dataroot_lq: /add02/users/yex/projects/2025-CVPR-MaIR/datasets/GoPro/test/input.lmdb
+    max_samples: 50
+    subset_mode: random
+    subset_seed: 42
+    io_backend:
+      type: lmdb
+
+network_g:
+  type: MaIRUNet_SSGR
+  adapter_positions: ['enc2', 'enc3', 'lat']
+  adapter_mode: additive
+  adapter_var_kernel: 5
+  adapter_gate_init_bias: -3.0
+  adapter_noise_adaptive_gate: false
+  adapter_spectral_mode: additive
+  adapter_hf_shortcut_bound: 0.15
+  freeze_backbone: false
+
+  inp_channels: 3
+  out_channels: 3
+  dim: 48
+  num_blocks: [4, 6, 6, 8]
+  num_refinement_blocks: 4
+  ssm_ratio: 2.0
+  flp_ratio: 4.0
+  mlp_ratio: 1.5
+  bias: false
+  dual_pixel_task: false
+  img_size: 128
+  scan_len: 4
+  batch_size: 1
+  dynamic_ids: false
+
+path:
+  pretrain_network_g: experiments/train_MaIRUNet_SSGR_Deblur/models/net_g_latest.pth
+  strict_load_g: false
+
+val:
+  window_size: 8
+  tile: 768
+  tile_overlap: 32
+  progress_bar: true
+  save_img: false
+  rgb2bgr: true
+  use_image: true
+  max_minibatch: 1
+
+  metrics:
+    psnr:
+      type: calculate_psnr
+      crop_border: 0
+      test_y_channel: false
+    ssim:
+      type: calculate_ssim
+      crop_border: 0
+      test_y_channel: false
+
+dist_params:
+  backend: nccl
+  port: 29532

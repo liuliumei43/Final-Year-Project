@@ -11,8 +11,8 @@ datasets:
     task: SR
     name: DIV2K
     type: PairedImageDataset
-    dataroot_gt: /xlearning/boyun/datasets/DIV2K/DIV2K_train_HR
-    dataroot_lq: /xlearning/boyun/datasets/DIV2K/DIV2K_train_LR_bicubic/X2/
+    dataroot_gt: /add02/users/yex/projects/2025-CVPR-MaIR/datasets/DIV2K/DIV2K_train_HR
+    dataroot_lq: /add02/users/yex/projects/2025-CVPR-MaIR/datasets/DIV2K/DIV2K_train_LR_bicubic/X2
     filename_tmpl: '{}x2'
     io_backend:
       type: disk
@@ -31,9 +31,9 @@ datasets:
   val:
     name: Urban100
     type: PairedImageDataset
-    dataroot_gt: /xlearning/boyun/datasets/SR/Test/Urban100/HR
-    dataroot_lq: /xlearning/boyun/datasets/SR/Test/Urban100/LR_bicubic/X2/
-    filename_tmpl: '{}'
+    dataroot_gt: /add02/users/yex/projects/2025-CVPR-MaIR/datasets/SR/Test/Urban100/HR
+    dataroot_lq: /add02/users/yex/projects/2025-CVPR-MaIR/datasets/SR/Test/Urban100/LR_bicubic/X2
+    filename_tmpl: '{}x2'
     io_backend:
       type: disk
 
@@ -86,12 +86,10 @@ train:
 
 # validation settings
 val:
-  # val_freq and val_freq_final is used for trainF.py, where first 400000 iters we only validate model every 25k iters, after that we validate every 5k iters
-  # It is mainly because that the training is not stable at the beginning, and validation is also time consuming since IO speed of our GPU is not enough.
-  # So we validate less frequently at the beginning.
-  val_freq: !!float 25e3
+  # Validate every 10k iters before 250k, and every 5k iters afterwards.
+  val_freq: !!float 10e3
   val_freq_final: !!float 5e3
-  val_milestone: 400000 
+  val_milestone: 250000 
 
   save_img: false
 
@@ -117,4 +115,4 @@ logger:
 # dist training settings
 dist_params:
   backend: nccl
-  port: 29500
+  port: 29501

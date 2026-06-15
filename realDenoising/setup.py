@@ -68,7 +68,7 @@ __version__ = '{}'
 short_version = '{}'
 version_info = ({})
 """
-    sha = get_hash()
+    sha = "unknown"
     with open('VERSION', 'r') as f:
         SHORT_VERSION = f.read().strip()
     VERSION_INFO = ', '.join(

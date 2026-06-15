@@ -1,0 +1,45 @@
+# Python cache/build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+.eggs/
+*.egg-info/
+build/
+dist/
+
+# Environments and local config
+.env
+.venv/
+venv/
+env/
+.vscode/
+.idea/
+.ipynb_checkpoints/
+
+# Data, checkpoints, and experiment outputs
+datasets/
+data/
+ckpt/
+checkpoints/
+weights/
+experiments/
+results/
+logs/
+*.log
+train_*/
+realDenoising/train_*/
+*.pth
+*.pt
+*.ckpt
+*.onnx
+
+# Local wheels / binary packages
+*.whl
+
+# Codex/local assistant files
+.codex/
+.agents/
+
+# OS files
+.DS_Store
+Thumbs.db

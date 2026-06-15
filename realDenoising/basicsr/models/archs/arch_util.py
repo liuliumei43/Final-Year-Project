@@ -4,7 +4,12 @@ from torch import nn as nn
 from torch.nn import functional as F
 from torch.nn import init as init
 from torch.nn.modules.batchnorm import _BatchNorm
-
+from basicsr.models.archs.shift_scanf_util import (
+    mair_ids_generate, 
+    mair_ids_scan, 
+    mair_ids_inverse, 
+    mair_shift_ids_generate
+)
 from basicsr.utils import get_root_logger
 
 # try:

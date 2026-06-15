@@ -1,0 +1,7 @@
+name: img092
+rank: 1
+crop: 720,512,64,64
+tiny_path: results/test_MaIR_T_lightSR_x2_visual_UrbanManga/visualization/Urban100/img092x2_tiny.png
+ssgr_path: results/test_MaIR_SSGR_T_lightSR_x2_visual_UrbanManga/visualization/Urban100/img092x2_ssgr.png
+gt_path: datasets/SR/Test/Urban100/HR/img092.png
+lq_path: datasets/SR/Test/Urban100/LR_bicubic/X2/img092x2.png

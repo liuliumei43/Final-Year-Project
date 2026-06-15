@@ -9,8 +9,8 @@ datasets:
   test_1:  
     name: SIDD-Val
     type: Dataset_PairedImage
-    dataroot_gt:  /xlearning/boyun/datasets/RealDN/val/crop_val/target_crops
-    dataroot_lq:  /xlearning/boyun/datasets/RealDN/val/crop_val/input_crops
+    dataroot_gt:  /add02/users/yex/projects/2025-CVPR-MaIR/datasets/SIDD/val/target_crops
+    dataroot_lq:  /add02/users/yex/projects/2025-CVPR-MaIR/datasets/SIDD/val/input_crops
     io_backend:
       type: disk
 
@@ -35,7 +35,7 @@ network_g:
   dynamic_ids: False
 
 path:
-  pretrain_network_g: ckpt/MaIR_RealDN.ckpt
+  pretrain_network_g: /add02/users/yex/projects/2025-CVPR-MaIR/ckpt/MaIR_RealDN.pth
   strict_load_g: true
 
 # validation settings

@@ -43,9 +43,8 @@ class BaseModel():
             save_img (bool): Whether to save images. Default: False.
         """
         if self.opt['dist']:
-            self.dist_validation(dataloader, current_iter, tb_logger, save_img)
-        else:
-            self.nondist_validation(dataloader, current_iter, tb_logger, save_img)
+            return self.dist_validation(dataloader, current_iter, tb_logger, save_img)
+        return self.nondist_validation(dataloader, current_iter, tb_logger, save_img)
 
     def _initialize_best_metric_results(self, dataset_name):
         """Initialize the best metric results dict for recording the best metric value and iteration."""
@@ -102,7 +101,11 @@ class BaseModel():
 
     def get_optimizer(self, optim_type, params, lr, **kwargs):
         if optim_type == 'Adam':
-            optimizer = torch.optim.Adam(params, lr, **kwargs)
+            # params 可为 param_groups: [{'params': ..., 'lr': ...}, ...]
+            if isinstance(params, list) and len(params) and isinstance(params[0], dict) and 'params' in params[0]:
+                optimizer = torch.optim.Adam(params, lr=lr, **kwargs)
+            else:
+                optimizer = torch.optim.Adam(params, lr, **kwargs)
         else:
             raise NotImplementedError(f'optimizer {optim_type} is not supperted yet.')
         return optimizer
@@ -293,12 +296,22 @@ class BaseModel():
                 param_key = 'params'
                 logger.info('Loading: params_ema does not exist, use params.')
             load_net = load_net[param_key]
-        logger.info(f'Loading {net.__class__.__name__} model from {load_path}, with param key: [{param_key}].')
         # remove unnecessary 'module.'
         for k, v in deepcopy(load_net).items():
             if k.startswith('module.'):
                 load_net[k[7:]] = v
                 load_net.pop(k)
+        # MaIR_FFT 等：整网 key 为 backbone.xxx，预训练 pth 为 xxx；若匹配 backbone，则加载到 backbone
+        if hasattr(net, 'backbone') and not any(k.startswith('backbone.') for k in load_net.keys()):
+            backbone_keys = set(net.backbone.state_dict().keys())
+            backbone_state = {k: v for k, v in load_net.items() if k in backbone_keys}
+            if len(backbone_state) > 0:
+                net.backbone.load_state_dict(backbone_state, strict=strict)
+                logger.info(f'Loading {net.__class__.__name__} backbone from {load_path}: {len(backbone_state)}/{len(backbone_keys)} keys, param key: [{param_key}].')
+                if getattr(net, 'freeze_backbone_after_load', False) and hasattr(net, 'freeze_backbone'):
+                    net.freeze_backbone()
+                return
+        logger.info(f'Loading {net.__class__.__name__} model from {load_path}, with param key: [{param_key}].')
         self._print_different_keys_loading(net, load_net, strict)
         net.load_state_dict(load_net, strict=strict)
 

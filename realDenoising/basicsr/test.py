@@ -50,6 +50,14 @@ def main():
     # create model
     model = create_model(opt)
 
+    # Optional: apply TLC (Test-time Local Converter) to fix train/test
+    # global-pool mismatch. Enabled via `val.use_tlc: true` in the yml.
+    if opt['val'].get('use_tlc', False):
+        from basicsr.models.archs.tlc_util import convert_to_tlc
+        train_size = opt['val'].get('tlc_train_size', [1, 3, 128, 128])
+        bare = model.net_g.module if hasattr(model.net_g, 'module') else model.net_g
+        convert_to_tlc(bare, train_size=tuple(train_size))
+
     for test_loader in test_loaders:
         test_set_name = test_loader.dataset.opt['name']
         logger.info(f'Testing {test_set_name}...')

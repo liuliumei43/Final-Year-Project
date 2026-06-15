@@ -20,14 +20,18 @@ class SRModel(BaseModel):
 
         # define network
         self.net_g = build_network(opt['network_g'])
-        self.net_g = self.model_to_device(self.net_g)
-        self.print_network(self.net_g)
-
-        # load pretrained models
+        # load pretrained models before DDP/DataParallel wrapping
         load_path = self.opt['path'].get('pretrain_network_g', None)
         if load_path is not None:
             param_key = self.opt['path'].get('param_key_g', 'params')
-            self.load_network(self.net_g, load_path, self.opt['path'].get('strict_load_g', True), param_key)
+            # 必须对「裸模型」检查，避免 DP/DDP 包装后 hasattr 异常；MaIR_FFT 需用 load_pretrained_mair 把权重加载到 backbone
+            if hasattr(self.net_g, 'load_pretrained_mair'):
+                self.net_g.load_pretrained_mair(load_path, strict=False, param_key=param_key)
+            else:
+                self.load_network(self.net_g, load_path, self.opt['path'].get('strict_load_g', True), param_key)
+
+        self.net_g = self.model_to_device(self.net_g)
+        self.print_network(self.net_g)
 
         if self.is_train:
             self.init_training_settings()
@@ -44,13 +48,35 @@ class SRModel(BaseModel):
             # net_g_ema is used only for testing on one GPU and saving
             # There is no need to wrap with DistributedDataParallel
             self.net_g_ema = build_network(self.opt['network_g']).to(self.device)
-            # load pretrained model
+            # load pretrained model（与 net_g 一致：对裸模型调用 load_pretrained_mair 或走 load_network 的 backbone 兼容）
             load_path = self.opt['path'].get('pretrain_network_g', None)
             if load_path is not None:
-                self.load_network(self.net_g_ema, load_path, self.opt['path'].get('strict_load_g', True), 'params_ema')
+                net_ema = self.get_bare_model(self.net_g_ema)
+                param_key = self.opt['path'].get('param_key_g', 'params')
+                if hasattr(net_ema, 'load_pretrained_mair'):
+                    net_ema.load_pretrained_mair(load_path, strict=False, param_key=param_key)
+                else:
+                    self.load_network(self.net_g_ema, load_path, self.opt['path'].get('strict_load_g', True), param_key)
             else:
                 self.model_ema(0)  # copy net_g weight
             self.net_g_ema.eval()
+
+        self.net_t = None
+        teacher_path = self.opt['path'].get('pretrain_network_t', None)
+        teacher_opt = self.opt.get('network_t', None)
+        if teacher_path is not None and teacher_opt is not None:
+            logger = get_root_logger()
+            self.net_t = build_network(teacher_opt).to(self.device)
+            param_key_t = self.opt['path'].get('param_key_t', 'params')
+            strict_load_t = self.opt['path'].get('strict_load_t', True)
+            if hasattr(self.net_t, 'load_pretrained_mair'):
+                self.net_t.load_pretrained_mair(teacher_path, strict=strict_load_t, param_key=param_key_t)
+            else:
+                self.load_network(self.net_t, teacher_path, strict_load_t, param_key_t)
+            self.net_t.eval()
+            for p in self.net_t.parameters():
+                p.requires_grad = False
+            logger.info(f'Loaded teacher network from {teacher_path} (param_key={param_key_t}).')
 
         # define losses
         if train_opt.get('pixel_opt'):
@@ -63,6 +89,21 @@ class SRModel(BaseModel):
         else:
             self.cri_perceptual = None
 
+        if train_opt.get('freq_opt'):
+            self.cri_freq = build_loss(train_opt['freq_opt']).to(self.device)
+        else:
+            self.cri_freq = None
+
+        if train_opt.get('luma_opt'):
+            self.cri_luma = build_loss(train_opt['luma_opt']).to(self.device)
+        else:
+            self.cri_luma = None
+
+        if train_opt.get('teacher_opt'):
+            self.cri_teacher = build_loss(train_opt['teacher_opt']).to(self.device)
+        else:
+            self.cri_teacher = None
+
         if self.cri_pix is None and self.cri_perceptual is None:
             raise ValueError('Both pixel and perceptual losses are None.')
 
@@ -72,16 +113,47 @@ class SRModel(BaseModel):
 
     def setup_optimizers(self):
         train_opt = self.opt['train']
+        backbone_lr_scale = train_opt['optim_g'].pop('backbone_lr_scale', None)
+
+        net = self.get_bare_model(self.net_g)
         optim_params = []
-        for k, v in self.net_g.named_parameters():
+        backbone_params = []
+        other_params = []
+        frozen_param_names = []
+        for k, v in net.named_parameters():
             if v.requires_grad:
                 optim_params.append(v)
+                if backbone_lr_scale is not None and k.startswith('backbone.'):
+                    backbone_params.append(v)
+                else:
+                    other_params.append(v)
             else:
-                logger = get_root_logger()
-                logger.warning(f'Params {k} will not be optimized.')
+                frozen_param_names.append(k)
+
+        if frozen_param_names:
+            logger = get_root_logger()
+            preview = ', '.join(frozen_param_names[:12])
+            more = '' if len(frozen_param_names) <= 12 else f' (+{len(frozen_param_names) - 12} more)'
+            logger.info(f'Frozen params: {len(frozen_param_names)}. Preview: {preview}{more}')
 
         optim_type = train_opt['optim_g'].pop('type')
-        self.optimizer_g = self.get_optimizer(optim_type, optim_params, **train_opt['optim_g'])
+        lr = train_opt['optim_g'].get('lr')
+        if backbone_lr_scale is not None and len(backbone_params) > 0 and len(other_params) > 0 and lr is not None:
+            backbone_lr = lr * backbone_lr_scale
+            param_groups = [
+                {'params': backbone_params, 'lr': backbone_lr},
+                {'params': other_params, 'lr': lr},
+            ]
+            logger = get_root_logger()
+            logger.info(f'Optimizer param_groups: backbone lr={backbone_lr}, rest lr={lr} (backbone_lr_scale={backbone_lr_scale})')
+            logger.info(
+                f'Optimizer trainable tensors: backbone={len(backbone_params)}, other={len(other_params)}, '
+                f'total={len(optim_params)}')
+            self.optimizer_g = self.get_optimizer(optim_type, param_groups, **train_opt['optim_g'])
+        else:
+            logger = get_root_logger()
+            logger.info(f'Optimizer trainable tensors: total={len(optim_params)}')
+            self.optimizer_g = self.get_optimizer(optim_type, optim_params, **train_opt['optim_g'])
         self.optimizers.append(self.optimizer_g)
 
     def feed_data(self, data):
@@ -92,6 +164,10 @@ class SRModel(BaseModel):
     def optimize_parameters(self, current_iter):
         self.optimizer_g.zero_grad()
         self.output = self.net_g(self.lq)
+        teacher_output = None
+        if self.net_t is not None:
+            with torch.no_grad():
+                teacher_output = self.net_t(self.lq)
 
         l_total = 0
         loss_dict = OrderedDict()
@@ -109,9 +185,84 @@ class SRModel(BaseModel):
             if l_style is not None:
                 l_total += l_style
                 loss_dict['l_style'] = l_style
+        # 频域损失（配合 FFT 分支）：在频域约束 pred 与 gt 一致，减轻 FFT 分支学到噪声
+        if self.cri_freq:
+            l_freq = self.cri_freq(self.output, self.gt)
+            l_total += l_freq
+            loss_dict['l_freq'] = l_freq
+        if self.cri_luma:
+            l_luma = self.cri_luma(self.output, self.gt)
+            l_total += l_luma
+            loss_dict['l_luma'] = l_luma
+        if self.cri_teacher and teacher_output is not None:
+            l_teacher = self.cri_teacher(self.output, teacher_output, gt=self.gt)
+            l_total += l_teacher
+            loss_dict['l_teacher'] = l_teacher
 
-        l_total.backward()
-        self.optimizer_g.step()
+        if not torch.isfinite(l_total):
+            logger = get_root_logger()
+            logger.warning(
+                f'Non-finite loss detected at iter {current_iter}. '
+                f'Skip this update. l_pix={loss_dict.get("l_pix")}, '
+                f'l_freq={loss_dict.get("l_freq")}, l_luma={loss_dict.get("l_luma")}'
+            )
+            self.optimizer_g.zero_grad(set_to_none=True)
+            sanitized_loss = OrderedDict()
+            for k, v in loss_dict.items():
+                sanitized_loss[k] = torch.nan_to_num(v.detach(), nan=0.0, posinf=1e6, neginf=-1e6)
+            self.log_dict = self.reduce_loss_dict(sanitized_loss)
+            return
+
+        # bypass_fft_fusion=True 时前向只走冻结的 backbone，输出无梯度，不能 backward
+        if l_total.requires_grad and l_total.grad_fn is not None:
+            l_total.backward()
+            net = self.get_bare_model(self.net_g)
+            sanitize_nonfinite_grads = bool(self.opt['train'].get('sanitize_nonfinite_grads', False))
+            nonfinite_grad_names = []
+            nonfinite_grad_stats = []
+            for name, p in net.named_parameters():
+                if p.grad is not None and not torch.isfinite(p.grad).all():
+                    nonfinite_grad_names.append(name)
+                    grad = p.grad.detach()
+                    finite_grad = grad[torch.isfinite(grad)]
+                    if finite_grad.numel() > 0:
+                        grad_abs_max = finite_grad.abs().max().item()
+                        grad_abs_mean = finite_grad.abs().mean().item()
+                    else:
+                        grad_abs_max = float('nan')
+                        grad_abs_mean = float('nan')
+                    nonfinite_grad_stats.append((name, grad_abs_max, grad_abs_mean))
+                    if sanitize_nonfinite_grads:
+                        p.grad = torch.nan_to_num(p.grad, nan=0.0, posinf=0.0, neginf=0.0)
+            if len(nonfinite_grad_names) > 0 and not sanitize_nonfinite_grads:
+                logger = get_root_logger()
+                first_name, grad_abs_max, grad_abs_mean = nonfinite_grad_stats[0]
+                logger.warning(
+                    f'Non-finite gradients detected at iter {current_iter}. '
+                    f'First bad param: {first_name}, finite_grad_abs_max={grad_abs_max:.4e}, '
+                    f'finite_grad_abs_mean={grad_abs_mean:.4e}. Skip optimizer step.'
+                )
+                self.optimizer_g.zero_grad(set_to_none=True)
+                sanitized_loss = OrderedDict()
+                for k, v in loss_dict.items():
+                    sanitized_loss[k] = torch.nan_to_num(v.detach(), nan=0.0, posinf=1e6, neginf=-1e6)
+                self.log_dict = self.reduce_loss_dict(sanitized_loss)
+                return
+            elif len(nonfinite_grad_names) > 0 and sanitize_nonfinite_grads:
+                logger = get_root_logger()
+                first_name, grad_abs_max, grad_abs_mean = nonfinite_grad_stats[0]
+                logger.warning(
+                    f'Non-finite gradients detected at iter {current_iter}. '
+                    f'Sanitized {len(nonfinite_grad_names)} param gradients. '
+                    f'First bad param: {first_name}, finite_grad_abs_max={grad_abs_max:.4e}, '
+                    f'finite_grad_abs_mean={grad_abs_mean:.4e}.'
+                )
+
+            grad_clip = self.opt['train'].get('grad_clip', None)
+            if grad_clip is not None and float(grad_clip) > 0:
+                torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=float(grad_clip))
+            self.optimizer_g.step()
+        # else: 仅前向与 loss 记录，不更新参数（如用于验证加载后的 backbone PSNR）
 
         self.log_dict = self.reduce_loss_dict(loss_dict)
 
@@ -180,7 +331,8 @@ class SRModel(BaseModel):
 
     def dist_validation(self, dataloader, current_iter, tb_logger, save_img):
         if self.opt['rank'] == 0:
-            self.nondist_validation(dataloader, current_iter, tb_logger, save_img)
+            return self.nondist_validation(dataloader, current_iter, tb_logger, save_img)
+        return None
 
     def nondist_validation(self, dataloader, current_iter, tb_logger, save_img):
         dataset_name = dataloader.dataset.opt['name']
@@ -203,7 +355,10 @@ class SRModel(BaseModel):
         for idx, val_data in enumerate(dataloader):
             img_name = osp.splitext(osp.basename(val_data['lq_path'][0]))[0]
             self.feed_data(val_data)
-            self.test()
+            if self.opt['val'].get('selfensemble', False):
+                self.test_selfensemble()
+            else:
+                self.test()
 
             visuals = self.get_current_visuals()
             sr_img = tensor2img([visuals['result']])
@@ -248,6 +403,8 @@ class SRModel(BaseModel):
                 self._update_best_metric_result(dataset_name, metric, self.metric_results[metric], current_iter)
 
             self._log_validation_metric_values(current_iter, dataset_name, tb_logger)
+            return dict(self.metric_results)
+        return None
 
     def _log_validation_metric_values(self, current_iter, dataset_name, tb_logger):
         log_str = f'Validation {dataset_name}\n'

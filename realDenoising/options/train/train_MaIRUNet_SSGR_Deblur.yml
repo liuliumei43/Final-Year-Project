@@ -1,0 +1,152 @@
+# SSGR Deblur — MaIRUNet GoPro Motion Deblurring
+#
+# 论文叙事（三任务统一）：
+#   SR:     SSGRAdapter @ encoder [enc2,enc3,lat], additive, stats=features, co-train
+#   DN:     SSGRAdapter @ decoder [dec1],          subtractive, stats=inp_img, 末端微调
+#   Deblur: SSGRAdapter @ encoder [enc2,enc3,lat], additive, stats=features, 末端微调
+#
+# Deblur 与 SR 共用 additive+features 配置，印证 adapter 在"增强"任务上的通用性
+# Backbone 策略：局部解冻末端 + backbone_lr_scale=0.1（与 RealDN v3.5b 一致）
+
+name: train_MaIRUNet_SSGR_Deblur
+model_type: ImageCleanModel
+scale: 1
+num_gpu: 2
+manual_seed: 100
+
+datasets:
+  train:
+    name: GoPro-TrainSet
+    type: Dataset_PairedImage
+    dataroot_gt: /add02/users/yex/projects/2025-CVPR-MaIR/datasets/train/target
+    dataroot_lq: /add02/users/yex/projects/2025-CVPR-MaIR/datasets/train/input
+    geometric_augs: true
+    filename_tmpl: '{}'
+    io_backend:
+      type: disk
+
+    use_shuffle: true
+    num_worker_per_gpu: 16
+    batch_size_per_gpu: 4
+
+    # Progressive training
+    mini_batch_sizes: [4, 2, 2, 1]
+    iters: [46000, 40000, 48000, 66000]
+    gt_size: 256
+    gt_sizes: [128, 160, 192, 256]
+
+    dataset_enlarge_ratio: 100
+    prefetch_mode: ~
+
+  val:
+    name: GoPro-ValSet
+    type: Dataset_PairedImage
+    dataroot_gt: /add02/users/yex/projects/2025-CVPR-MaIR/datasets/GoPro/test/target.lmdb
+    dataroot_lq: /add02/users/yex/projects/2025-CVPR-MaIR/datasets/GoPro/test/input.lmdb
+    io_backend:
+      type: lmdb
+
+network_g:
+  type: MaIRUNet_SSGR
+  # Adapter config — additive，与 SR 保持一致
+  adapter_positions: ['enc2', 'enc3', 'lat']       # ★ 编码器深层，同 SR
+  adapter_mode: additive                            # ★ 增强模式（deblur/SR 共用）
+  adapter_var_kernel: 5
+  adapter_gate_init_bias: -3.0
+  adapter_noise_adaptive_gate: false                # ★ false，非去噪任务
+  adapter_spectral_mode: additive                   # ★ 频域增强
+  adapter_hf_shortcut_bound: 0.15                  # ★ 高频补偿（锐化有利）
+
+  # Backbone 局部解冻：adapter 输出的直接消费层 + 末端
+  freeze_backbone: true
+  backbone_trainable_prefixes:
+    - decoder_level1
+    - decoder_level2
+    - decoder_level3
+    - reduce_chan_level2
+    - reduce_chan_level3
+    - up4_3
+    - up3_2
+    - refinement
+    - output
+
+  # MaIRUNet backbone parameters (same as original)
+  inp_channels: 3
+  out_channels: 3
+  dim: 48
+  num_blocks: [4, 6, 6, 8]
+  num_refinement_blocks: 4
+  ssm_ratio: 2.0
+  flp_ratio: 4.0
+  mlp_ratio: 1.5
+  bias: False
+  dual_pixel_task: False
+  img_size: 128
+  scan_len: 4
+  batch_size: 4
+  dynamic_ids: False
+
+path:
+  pretrain_network_g: /add02/users/yex/projects/2025-CVPR-MaIR/ckpt/MaIR_MotionDeblur.pth
+  strict_load_g: false
+  resume_state: ~
+
+train:
+  total_iter: 200000
+  warmup_iter: -1
+  use_grad_clip: true
+
+  scheduler:
+    type: CosineAnnealingRestartCyclicLR
+    periods: [46000, 154000]
+    restart_weights: [1, 1]
+    eta_mins: [0.00005, 0.000001]
+
+  mixing_augs:
+    mixup: false                                    # deblur 不用 mixup
+    mixup_beta: 1.2
+    use_identity: true
+
+  optim_g:
+    type: AdamW
+    lr: !!float 5e-5                               # adapter lr
+    backbone_lr_scale: 0.02                        # backbone lr = 1e-6
+    weight_decay: !!float 1e-4
+    betas: [0.9, 0.999]
+
+  pixel_opt:
+    type: L1Loss
+    loss_weight: 1
+    reduction: mean
+
+val:
+  val_freq: 999999999                              # 禁用，训练完用 test.py 手动评估
+  val_freq_final: 999999999
+  val_milestone: 999999999
+  window_size: 8
+  save_img: false
+  rgb2bgr: true
+  use_image: true                                  # GoPro val 用 uint8
+  max_minibatch: 8
+
+  metrics:
+    psnr:
+      type: calculate_psnr
+      crop_border: 0
+      test_y_channel: false
+    ssim:
+      type: calculate_ssim
+      crop_border: 0
+      test_y_channel: false
+
+logger:
+  print_freq: 200
+  save_checkpoint_freq: 1000
+  use_tb_logger: true
+  wandb:
+    project: ~
+    resume_id: ~
+
+dist_params:
+  backend: nccl
+  port: 29512

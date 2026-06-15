@@ -1,0 +1,171 @@
+# VGR: Variance-Gated Spatial Refinement (v2 — with zero-init + backbone unfreeze)
+# Purely spatial-domain, content-adaptive feature refinement
+#
+# v2 fixes over v1:
+# 1. Zero-initialized refine output → exact identity at start (no Manga109 corruption)
+# 2. Lower gate_init_bias (-6 vs -4) → sigmoid(-6) ≈ 0.0025 (7x more conservative)
+# 3. Unfreeze last backbone layer (layers.3) → allows backbone to learn better features
+#    (with frozen backbone, post-backbone modules can only REDISTRIBUTE performance,
+#     not improve total avg PSNR — this is the root cause of all prior failures)
+# 4. Lower backbone_lr_scale (0.02 vs 0.05) → more conservative backbone fine-tuning
+
+name: train_MaIR_VGR_T_lightSR_x2
+model_type: MambaIRModel
+scale: 2
+num_gpu: 2
+manual_seed: 10
+find_unused_parameters: false
+
+datasets:
+  train:
+    task: SR
+    name: DIV2K
+    type: PairedImageDataset
+    dataroot_gt: /add02/users/yex/projects/2025-CVPR-MaIR/datasets/DIV2K/DIV2K_train_HR
+    dataroot_lq: /add02/users/yex/projects/2025-CVPR-MaIR/datasets/DIV2K/DIV2K_train_LR_bicubic/X2
+    filename_tmpl: '{}x2'
+    io_backend:
+      type: disk
+
+    gt_size: 192
+    use_hflip: true
+    use_rot: true
+    use_shuffle: true
+    num_worker_per_gpu: 16
+    batch_size_per_gpu: 4
+    dataset_enlarge_ratio: 800
+    prefetch_mode: ~
+
+  val_1:
+    name: Set5
+    type: PairedImageDataset
+    dataroot_gt: /add02/users/yex/projects/2025-CVPR-MaIR/datasets/SR/Test/Set5/HR
+    dataroot_lq: /add02/users/yex/projects/2025-CVPR-MaIR/datasets/SR/Test/Set5/LR_bicubic/X2
+    filename_tmpl: '{}x2'
+    io_backend:
+      type: disk
+
+  val_2:
+    name: Set14
+    type: PairedImageDataset
+    dataroot_gt: /add02/users/yex/projects/2025-CVPR-MaIR/datasets/SR/Test/Set14/HR
+    dataroot_lq: /add02/users/yex/projects/2025-CVPR-MaIR/datasets/SR/Test/Set14/LR_bicubic/X2
+    filename_tmpl: '{}x2'
+    io_backend:
+      type: disk
+
+  val_3:
+    name: B100
+    type: PairedImageDataset
+    dataroot_gt: /add02/users/yex/projects/2025-CVPR-MaIR/datasets/SR/Test/B100/HR
+    dataroot_lq: /add02/users/yex/projects/2025-CVPR-MaIR/datasets/SR/Test/B100/LR_bicubic/X2
+    filename_tmpl: '{}x2'
+    io_backend:
+      type: disk
+
+  val_4:
+    name: Urban100
+    type: PairedImageDataset
+    dataroot_gt: /add02/users/yex/projects/2025-CVPR-MaIR/datasets/SR/Test/Urban100/HR
+    dataroot_lq: /add02/users/yex/projects/2025-CVPR-MaIR/datasets/SR/Test/Urban100/LR_bicubic/X2
+    filename_tmpl: '{}x2'
+    io_backend:
+      type: disk
+
+  val_5:
+    name: Manga109
+    type: PairedImageDataset
+    dataroot_gt: /add02/users/yex/projects/2025-CVPR-MaIR/datasets/SR/Test/Manga109/HR
+    dataroot_lq: /add02/users/yex/projects/2025-CVPR-MaIR/datasets/SR/Test/Manga109/LR_bicubic/X2
+    filename_tmpl: '{}_LRBI_x2'
+    io_backend:
+      type: disk
+
+network_g:
+  type: MaIR_VGR
+  freeze_backbone_after_load: true
+  backbone_trainable_prefixes: ['conv_after_body', 'upsample', 'layers.3']
+
+  # VGR parameters (ultra-lightweight, ~6K params)
+  vgr_reduction: 8
+  vgr_refine_kernel: 3
+  vgr_var_kernel: 5
+  vgr_gate_init_bias: -6.0
+
+  # MaIR backbone parameters (same as baseline MaIR-T)
+  upscale: 2
+  in_chans: 3
+  img_range: 1.
+  d_state: 1
+  depths: [6, 6, 6, 6]
+  embed_dim: 60
+  ssm_ratio: 1.1
+  mlp_ratio: 1.6
+  upsampler: 'pixelshuffledirect'
+  resi_connection: '1conv'
+  img_size: 64
+  dynamic_ids: false
+  scan_len: 8
+
+path:
+  pretrain_network_g: /add02/users/yex/projects/2025-CVPR-MaIR/ckpt/MaIR_T_lightSR_x2.pth
+  param_key_g: params
+  strict_load_g: false
+
+train:
+  ema_decay: 0.999
+  grad_clip: 0.05
+
+  optim_g:
+    type: Adam
+    lr: !!float 1.2e-4
+    backbone_lr_scale: 0.02
+    weight_decay: 0
+    betas: [0.9, 0.99]
+
+  scheduler:
+    type: CosineAnnealingRestartLR
+    periods: [25000]
+    restart_weights: [1]
+    eta_min: !!float 1e-6
+
+  total_iter: 25000
+  warmup_iter: 1000
+
+  # CRITICAL: ONLY L1 pixel loss — NO frequency loss!
+  # Removing FFTFreqLoss eliminates the gradient bias toward high-frequency
+  # regions that causes Urban100/Manga109 imbalance in ALL freq-loss approaches.
+  pixel_opt:
+    type: L1Loss
+    loss_weight: 1.0
+    reduction: mean
+
+val:
+  val_freq: 1000
+  log_metric_freq: 1000
+  val_freq_final: !!float 1e3
+  val_milestone: 15000
+  save_img: false
+  avg_metric: psnr
+  save_best_avg: true
+  metrics:
+    psnr:
+      type: calculate_psnr
+      crop_border: 2
+      test_y_channel: true
+    ssim:
+      type: calculate_ssim
+      crop_border: 2
+      test_y_channel: true
+
+logger:
+  print_freq: 200
+  save_checkpoint_freq: 1000
+  use_tb_logger: true
+  wandb:
+    project: ~
+    resume_id: ~
+
+dist_params:
+  backend: nccl
+  port: 29500

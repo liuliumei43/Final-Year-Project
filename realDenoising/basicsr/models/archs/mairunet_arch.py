@@ -2,10 +2,12 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from timm.models.layers import DropPath, to_2tuple, trunc_normal_
+try:
+    from timm.layers import DropPath, to_2tuple, trunc_normal_
+except ImportError:
+    from timm.models.layers import DropPath, to_2tuple, trunc_normal_
 from pdb import set_trace as stx
 import numbers
-from timm.models.layers import DropPath, to_2tuple, trunc_normal_
 from mamba_ssm.ops.selective_scan_interface import selective_scan_fn, selective_scan_ref
 from einops import rearrange
 import math
@@ -13,8 +15,18 @@ from typing import Optional, Callable
 from einops import rearrange, repeat
 from functools import partial
 import sys
-sys.path.append('/xlearning/boyun/codes/MaIR/realDenoising')
-from shift_scanf_util import mair_ids_generate, mair_ids_scan, mair_ids_inverse, mair_shift_ids_generate
+# 将原有的 from shift_scanf_util import ... 修改为：
+from basicsr.models.archs.shift_scanf_util import (
+    mair_ids_generate, 
+    mair_ids_scan, 
+    mair_ids_inverse, 
+    mair_shift_ids_generate
+)
+
+
+import sys
+sys.path.append('/root/autodl-tmp/2025-CVPR-MaIR/realDenoising')
+from .shift_scanf_util import mair_ids_generate, mair_ids_scan, mair_ids_inverse, mair_shift_ids_generate
 
 NEG_INF = -1000000
 
@@ -441,8 +453,8 @@ class Upsample(nn.Module):
         x = rearrange(x, "b c h w -> b (h w) c").contiguous()
         return x
 
-from basicsr.utils.registry import ARCH_REGISTRY
-@ARCH_REGISTRY.register()
+# from basicsr.utils import ARCH_REGISTRY
+# @ARCH_REGISTRY.register()
 class MaIRUNet(nn.Module):
     def __init__(self,
                  inp_channels=3,

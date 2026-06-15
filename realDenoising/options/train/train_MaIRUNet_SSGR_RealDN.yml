@@ -1,0 +1,175 @@
+# SSGR RealDN — SR-Aggressive aligned (maximum-yield configuration)
+#
+# Mirrors train_MaIR_SSGR_T_lightSR_x2_finetune_aggressive.yml as closely as
+# the DN codebase allows. SR aggressive achieved avg +0.02 dB / Manga109 +0.04
+# over baseline 35.2973. This config transplants the same recipe to RealDN.
+#
+# SR Aggressive → RealDN mapping
+#   adapter_stages [0,1,2] (4 stages, skip last)
+#       → adapter_positions ['enc3','lat','dec3']  (7 stages, symmetric around
+#         bottleneck, skip shallow enc1/enc2 and late dec2/dec1 — same "skip
+#         first shallow + skip last" logic)
+#   full backbone unfreeze (4/4 layers + tail)
+#       → full backbone unfreeze (all encoder + latent + decoder + refinement + output)
+#   backbone_lr_scale 0.1  → 0.1           (identical)
+#   adapter lr 1.2e-4      → 1.0e-4        (SIDD slightly more conservative)
+#   ema_decay 0.999        → 0.999         (identical)
+#   warmup 5000            → 5000          (identical)
+#   total_iter 200k        → 200k          (identical)
+#   hf_shortcut_bound 0.15 → 0.15          (identical — key aggressive knob)
+#   grad_clip 0.05         → 0.05          (identical)
+#   FFTFreqLoss            → skipped       (not available in realDenoising)
+#   gt_size 256            → 128           (SIDD convention, keep)
+#   mixup                  → OFF           (SR aggressive does not use mixup)
+#
+# Task-specific (DN branch of universal SSGR):
+#   adapter_mode: subtractive
+#   spectral_mode: suppressive
+#   var_kernel: 7          (SR uses 5)
+#   stats_from_input at all 3 positions (noisy-image gate evidence)
+
+name: train_MaIRUNet_SSGR_RealDN_aggressive
+model_type: ImageCleanModel
+scale: 1
+num_gpu: 2
+manual_seed: 100
+
+datasets:
+  train:
+    name: SIDD-TrainSet
+    type: Dataset_PairedImage
+    dataroot_gt: /add02/users/yex/projects/2025-CVPR-MaIR/datasets/train/target_crops
+    dataroot_lq: /add02/users/yex/projects/2025-CVPR-MaIR/datasets/train/input_crops
+    geometric_augs: true
+    filename_tmpl: '{}'
+    io_backend:
+      type: disk
+
+    use_shuffle: true
+    num_worker_per_gpu: 8
+    batch_size_per_gpu: 4
+
+    mini_batch_sizes: [4]
+    iters: [200000]
+    gt_size: 128
+    gt_sizes: [128]
+
+    dataset_enlarge_ratio: 100
+    prefetch_mode: ~
+
+  val:
+    name: SIDD-ValSet
+    type: Dataset_PairedImage
+    dataroot_gt: /add02/users/yex/projects/2025-CVPR-MaIR/datasets/SIDD/val/target_crops
+    dataroot_lq: /add02/users/yex/projects/2025-CVPR-MaIR/datasets/SIDD/val/input_crops
+    io_backend:
+      type: disk
+
+network_g:
+  type: MaIRUNet_SSGR
+  # ★ SR-isomorphic multi-position (symmetric around bottleneck)
+  adapter_positions: ['enc3', 'lat', 'dec3']
+  adapter_stats_from_input: ['enc3', 'lat', 'dec3']
+  adapter_mode: subtractive
+  adapter_var_kernel: 7
+  adapter_gate_init_bias: -3.0
+  adapter_noise_adaptive_gate: true
+  adapter_spectral_mode: suppressive
+  adapter_hf_shortcut_bound: 0.15              # ★ aggressive: enable HF shortcut
+
+  # ★ Partial unfreeze: dec3 downstream only. Full unfreeze (SR aggressive style)
+  # proved too destructive for the already-saturated SIDD baseline (PSNR dropped
+  # 39.92 → 39.88 within 8k iters). Keeping encoder + latent frozen preserves
+  # the baseline representation while giving adapters + decoder room to adapt.
+  freeze_backbone: true
+  backbone_trainable_prefixes:
+    - decoder_level3
+    - up3_2
+    - reduce_chan_level2
+    - decoder_level2
+    - up2_1
+    - decoder_level1
+    - refinement
+    - output
+
+  # MaIRUNet backbone parameters
+  inp_channels: 3
+  out_channels: 3
+  dim: 48
+  num_blocks: [4, 6, 6, 8]
+  num_refinement_blocks: 4
+  ssm_ratio: 2.0
+  flp_ratio: 4.0
+  mlp_ratio: 1.5
+  bias: False
+  dual_pixel_task: False
+  img_size: 128
+  scan_len: 4
+  batch_size: 4
+  dynamic_ids: False
+
+path:
+  pretrain_network_g: /add02/users/yex/projects/2025-CVPR-MaIR/ckpt/MaIR_RealDN.pth
+  strict_load_g: false
+  resume_state: ~
+
+train:
+  total_iter: 200000
+  warmup_iter: 2000                            # ★ shorter warmup (partial unfreeze)
+  use_grad_clip: true
+  ema_decay: 0.999                             # ★ aggressive: enable EMA
+
+  scheduler:
+    type: CosineAnnealingRestartCyclicLR
+    periods: [200000]
+    restart_weights: [1]
+    eta_mins: [0.0000001]
+
+  mixing_augs:
+    mixup: false                               # ★ SR aggressive does not use mixup
+    mixup_beta: 1.2
+    use_identity: true
+
+  optim_g:
+    type: AdamW
+    lr: !!float 5e-5                           # ★ lowered from 1e-4 (SIDD baseline saturated)
+    backbone_lr_scale: 0.1                     # backbone lr = 5e-6
+    weight_decay: !!float 1e-4
+    betas: [0.9, 0.999]
+
+  pixel_opt:
+    type: L1Loss
+    loss_weight: 1
+    reduction: mean
+
+val:
+  val_freq: 2000
+  val_freq_final: 2000
+  val_milestone: 100000
+  window_size: 8
+  save_img: false
+  rgb2bgr: true
+  use_image: false
+  max_minibatch: 8
+
+  metrics:
+    psnr:
+      type: calculate_psnr
+      crop_border: 0
+      test_y_channel: false
+    ssim:
+      type: calculate_ssim
+      crop_border: 0
+      test_y_channel: false
+
+logger:
+  print_freq: 200
+  save_checkpoint_freq: 2000
+  use_tb_logger: true
+  wandb:
+    project: ~
+    resume_id: ~
+
+dist_params:
+  backend: nccl
+  port: 29511

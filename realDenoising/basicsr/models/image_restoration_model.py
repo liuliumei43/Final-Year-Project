@@ -1,4 +1,5 @@
 import importlib
+import math
 import torch
 from collections import OrderedDict
 from copy import deepcopy
@@ -56,10 +57,12 @@ class ImageCleanModel(BaseModel):
 
         # define network
 
-        self.mixing_flag = self.opt['train']['mixing_augs'].get('mixup', False)
+        train_opt = self.opt.get('train') or {}
+        mixing_opt = train_opt.get('mixing_augs', {})
+        self.mixing_flag = self.is_train and mixing_opt.get('mixup', False)
         if self.mixing_flag:
-            mixup_beta       = self.opt['train']['mixing_augs'].get('mixup_beta', 1.2)
-            use_identity     = self.opt['train']['mixing_augs'].get('use_identity', False)
+            mixup_beta = mixing_opt.get('mixup_beta', 1.2)
+            use_identity = mixing_opt.get('use_identity', False)
             self.mixing_augmentation = Mixing_Augment(mixup_beta, use_identity, self.device)
 
         self.net_g = define_network(deepcopy(opt['network_g']))
@@ -114,24 +117,66 @@ class ImageCleanModel(BaseModel):
 
     def setup_optimizers(self):
         train_opt = self.opt['train']
-        optim_params = []
-
-        for k, v in self.net_g.named_parameters():
-            if v.requires_grad:
-                optim_params.append(v)
-            else:
-                logger = get_root_logger()
-                logger.warning(f'Params {k} will not be optimized.')
-
         optim_type = train_opt['optim_g'].pop('type')
+        base_lr = train_opt['optim_g']['lr']
+        backbone_lr_scale = train_opt['optim_g'].pop('backbone_lr_scale', None)
+        self.backbone_lr_scale = backbone_lr_scale  # save for update_learning_rate
+
+        if backbone_lr_scale is not None:
+            # Layered LR: adapter params get base_lr, backbone params get base_lr * scale
+            adapter_params = []
+            backbone_params = []
+            logger = get_root_logger()
+            for k, v in self.net_g.named_parameters():
+                if not v.requires_grad:
+                    logger.warning(f'Params {k} will not be optimized.')
+                    continue
+                if 'adapters.' in k or 'adapter' in k:
+                    adapter_params.append(v)
+                else:
+                    backbone_params.append(v)
+            backbone_lr = base_lr * backbone_lr_scale
+            param_groups = [
+                {'params': adapter_params, 'lr': base_lr},
+                {'params': backbone_params, 'lr': backbone_lr},
+            ]
+            logger.info(
+                f'Layered LR: adapter_lr={base_lr}, '
+                f'backbone_lr={backbone_lr} (scale={backbone_lr_scale}), '
+                f'adapter_params={len(adapter_params)}, '
+                f'backbone_params={len(backbone_params)}'
+            )
+        else:
+            param_groups = []
+            for k, v in self.net_g.named_parameters():
+                if v.requires_grad:
+                    param_groups.append(v)
+                else:
+                    logger = get_root_logger()
+                    logger.warning(f'Params {k} will not be optimized.')
+
         if optim_type == 'Adam':
-            self.optimizer_g = torch.optim.Adam(optim_params, **train_opt['optim_g'])
+            self.optimizer_g = torch.optim.Adam(param_groups, **train_opt['optim_g'])
         elif optim_type == 'AdamW':
-            self.optimizer_g = torch.optim.AdamW(optim_params, **train_opt['optim_g'])
+            self.optimizer_g = torch.optim.AdamW(param_groups, **train_opt['optim_g'])
         else:
             raise NotImplementedError(
                 f'optimizer {optim_type} is not supperted yet.')
         self.optimizers.append(self.optimizer_g)
+
+    def update_learning_rate(self, current_iter, warmup_iter=-1):
+        """Override to re-enforce backbone_lr_scale after scheduler step.
+
+        CosineAnnealingRestartCyclicLR uses absolute eta_min values that
+        override per-group LR ratios. After the scheduler sets LRs, we
+        force backbone group lr = adapter group lr * backbone_lr_scale.
+        """
+        super().update_learning_rate(current_iter, warmup_iter)
+        if self.backbone_lr_scale is not None:
+            for optimizer in self.optimizers:
+                if len(optimizer.param_groups) >= 2:
+                    adapter_lr = optimizer.param_groups[0]['lr']
+                    optimizer.param_groups[1]['lr'] = adapter_lr * self.backbone_lr_scale
 
     def feed_train_data(self, data):
         self.lq = data['lq'].to(self.device)
@@ -204,11 +249,63 @@ class ImageCleanModel(BaseModel):
             self.output = pred
             self.net_g.train()
 
+    def tile_test(self, tile_size=256, tile_overlap=32, window_size=8):
+        """Tile-based inference to avoid OOM on large images (e.g. GoPro 1280x720)."""
+        scale = self.opt.get('scale', 1)
+        b, c, h, w = self.lq.shape
+        stride = tile_size - tile_overlap
+
+        h_tiles = max(1, math.ceil((h - tile_overlap) / stride))
+        w_tiles = max(1, math.ceil((w - tile_overlap) / stride))
+
+        output = self.lq.new_zeros(b, c, h * scale, w * scale)
+        weight = self.lq.new_zeros(b, 1, h * scale, w * scale)
+
+        for i in range(h_tiles):
+            for j in range(w_tiles):
+                top = i * stride
+                left = j * stride
+                bottom = min(top + tile_size, h)
+                right = min(left + tile_size, w)
+                # pull back so each tile is exactly tile_size when possible
+                top = max(0, bottom - tile_size)
+                left = max(0, right - tile_size)
+
+                tile = self.lq[:, :, top:bottom, left:right]
+                tile_h, tile_w = tile.shape[2], tile.shape[3]
+
+                # pad to window_size multiples
+                mod_h = (window_size - tile_h % window_size) % window_size
+                mod_w = (window_size - tile_w % window_size) % window_size
+                if mod_h or mod_w:
+                    tile = F.pad(tile, (0, mod_w, 0, mod_h), 'reflect')
+
+                with torch.no_grad():
+                    if hasattr(self, 'net_g_ema'):
+                        self.net_g_ema.eval()
+                        tile_out = self.net_g_ema(tile)
+                    else:
+                        self.net_g.eval()
+                        tile_out = self.net_g(tile)
+                    if isinstance(tile_out, list):
+                        tile_out = tile_out[-1]
+
+                tile_out = tile_out[:, :, :tile_h * scale, :tile_w * scale]
+                output[:, :, top*scale:bottom*scale, left*scale:right*scale] += tile_out
+                weight[:, :, top*scale:bottom*scale, left*scale:right*scale] += 1
+
+        output /= weight
+        self.output = output
+
     def dist_validation(self, dataloader, current_iter, tb_logger, save_img, rgb2bgr, use_image):
         if os.environ['LOCAL_RANK'] == '0':
-            return self.nondist_validation(dataloader, current_iter, tb_logger, save_img, rgb2bgr, use_image)
+            result = self.nondist_validation(dataloader, current_iter, tb_logger, save_img, rgb2bgr, use_image)
         else:
-            return 0.
+            result = 0.
+        # All ranks must wait here so rank 1 doesn't race ahead into
+        # the next training iteration while rank 0 is still validating.
+        torch.distributed.barrier()
+        return result
 
     def nondist_validation(self, dataloader, current_iter, tb_logger,
                            save_img, rgb2bgr, use_image):
@@ -219,18 +316,28 @@ class ImageCleanModel(BaseModel):
                 metric: 0
                 for metric in self.opt['val']['metrics'].keys()
             }
-        # pbar = tqdm(total=len(dataloader), unit='image')
-
         window_size = self.opt['val'].get('window_size', 0)
+        tile_size = self.opt['val'].get('tile', 0)
+        tile_overlap = self.opt['val'].get('tile_overlap', 32)
 
-        if window_size:
+        if tile_size:
+            test = partial(self.tile_test, tile_size, tile_overlap, window_size)
+        elif window_size:
             test = partial(self.pad_test, window_size)
         else:
             test = self.nonpad_test
 
         cnt = 0
+        val_iter = enumerate(dataloader)
+        if self.opt['val'].get('progress_bar', False):
+            val_iter = tqdm(
+                val_iter,
+                total=len(dataloader),
+                unit='image',
+                desc=f'Testing {dataset_name}',
+            )
 
-        for idx, val_data in enumerate(dataloader):
+        for idx, val_data in val_iter:
             img_name = osp.splitext(osp.basename(val_data['lq_path'][0]))[0]
 
             self.feed_data(val_data)

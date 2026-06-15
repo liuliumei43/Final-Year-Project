@@ -4,6 +4,8 @@ import os
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.abspath(os.path.join(current_dir, '..'))
 
+import warnings
+warnings.filterwarnings('ignore', category=FutureWarning)
 # Add the parent directory to sys.path
 sys.path.append(parent_dir)
 
@@ -195,12 +197,60 @@ def train_pipeline(root_path):
                 logger.info('Saving models and training states.')
                 model.save(epoch, current_iter)
 
-            # validation
-            if opt.get('val') is not None and (current_iter % opt['val']['val_freq'] == 0):
-                if len(val_loaders) > 1:
-                    logger.warning('Multiple validation datasets are *only* supported by SRModel.')
-                for val_loader in val_loaders:
-                    model.validation(val_loader, current_iter, tb_logger, opt['val']['save_img'])
+            # validation（每 val_freq 做完整验证；每 log_metric_freq 跑验证并打印 PSNR/SSIM）
+            if opt.get('val') is not None and len(val_loaders) > 0:
+                val_freq = int(opt['val']['val_freq'])
+                val_freq_final = opt['val'].get('val_freq_final', None)
+                val_milestone = int(opt['val'].get('val_milestone', 0))
+                if val_freq_final is not None and current_iter >= val_milestone:
+                    val_freq = int(val_freq_final)
+                log_metric_freq = int(opt['val'].get('log_metric_freq', val_freq))
+                do_val = (current_iter % val_freq == 0) or (log_metric_freq > 0 and current_iter % log_metric_freq == 0)
+                if do_val:
+                    logger.info(f'Validation at iter {current_iter} (val_freq={val_freq}, PSNR/SSIM below).')
+                    if len(val_loaders) > 1:
+                        logger.info('Multiple validation datasets detected; logging both per-set and average metrics.')
+                    save_img = opt['val'].get('save_img', False) and (current_iter % val_freq == 0)
+                    val_metric_list = []
+                    for val_loader in val_loaders:
+                        metrics = model.validation(val_loader, current_iter, tb_logger, save_img)
+                        if metrics:
+                            val_metric_list.append(metrics)
+                    if len(val_metric_list) > 1 and opt['rank'] == 0:
+                        avg_metrics = {}
+                        metric_names = val_metric_list[0].keys()
+                        for metric_name in metric_names:
+                            avg_metrics[metric_name] = sum(m[metric_name] for m in val_metric_list) / len(val_metric_list)
+                        avg_log = 'Validation Average\n'
+                        avg_metric_name = opt['val'].get('avg_metric', 'psnr')
+                        save_best_avg = bool(opt['val'].get('save_best_avg', True))
+                        improved_avg = False
+                        if hasattr(model, '_initialize_best_metric_results'):
+                            model._initialize_best_metric_results('Average')
+                        for metric_name, metric_val in avg_metrics.items():
+                            prev_best = None
+                            if hasattr(model, 'best_metric_results') and 'Average' in model.best_metric_results:
+                                prev_best = model.best_metric_results['Average'][metric_name]['val']
+                            if hasattr(model, '_update_best_metric_result'):
+                                model._update_best_metric_result('Average', metric_name, metric_val, current_iter)
+                            avg_log += f'\t # {metric_name}: {metric_val:.4f}\n'
+                            if hasattr(model, 'best_metric_results') and 'Average' in model.best_metric_results:
+                                avg_log += (
+                                    f'\t   Best: {model.best_metric_results["Average"][metric_name]["val"]:.4f} @ '
+                                    f'{model.best_metric_results["Average"][metric_name]["iter"]} iter\n'
+                                )
+                            if metric_name == avg_metric_name and prev_best is not None:
+                                if metric_val > prev_best + 1e-12:
+                                    improved_avg = True
+                            if tb_logger:
+                                tb_logger.add_scalar(f'metrics/avg/{metric_name}', metric_val, current_iter)
+                        logger.info(avg_log)
+                        if save_best_avg and improved_avg:
+                            logger.info(
+                                f'Saving best-average checkpoint at iter {current_iter} '
+                                f'(avg {avg_metric_name}={avg_metrics[avg_metric_name]:.4f}).'
+                            )
+                            model.save(epoch, 'bestavg')
 
             data_timer.start()
             iter_timer.start()
