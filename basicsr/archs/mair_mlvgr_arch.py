@@ -1,85 +1,57 @@
 """
-MaIR with Multi-Layer Variance-Gated Refinement (ML-VGR).
+MaIR 的多层方差门控细化版本（ML-VGR）。
 
-Core innovation: Inter-Stage Content-Adaptive Adaptation with
-Per-Channel Variance Gating + Full Backbone Fine-Tuning.
+这个文件主要记录在 MaIR 主干之间插入轻量 adapter 的几版尝试：
+用通道方差、局部梯度和频域分支来调节中间特征，同时保留主干的完整微调能力。
 
-v2.1 changes (addressing v2's Urban100 collapse + slow convergence):
-┌─────────────────────────────────────────────────────────────────────┐
-│ v2 diagnosis:                                                        │
-│   channel_mod (SE with global pooling) applies UNCONDITIONALLY —     │
-│   even when gate=0, output is x*ch_scale, not x. This constant      │
-│   perturbation destroys Urban100's periodic high-freq patterns.      │
-│   Also: only 50% backbone unfrozen → insufficient learning capacity. │
-│                                                                      │
-│ v2.1 fixes:                                                          │
-│   1. Remove channel_mod → pure variance-gated residual               │
-│   2. Unfreeze ALL backbone layers at conservative lr (0.01x)         │
-│      → 4x more trainable backbone params, 2-3x total gradient       │
-│   3. Adapters at stages [1,2] only (remove stage 0 — too early)      │
-│   4. gate_init_bias=-3.0 → sigmoid≈0.047 (faster activation)        │
-│   5. Adapters act as content-adaptive gradient modulators,            │
-│      guiding backbone fine-tuning to avoid 偏科                       │
-└─────────────────────────────────────────────────────────────────────┘
+v2.1：
+  之前的 v2 在 Urban100 上掉得比较明显，收敛也慢。主要原因是 channel_mod
+  使用全局池化后的 SE 缩放，不管 gate 是否关闭都会改变输入；也就是说 gate=0
+  时输出仍然是 x * ch_scale，不是干净的 x。对 Urban100 这类周期纹理多的数据，
+  这种固定扰动比较伤高频结构。另一个问题是只解冻了一半主干，容量不太够。
 
-v2.3 changes (addressing seesaw effect + 3000-iter HF forgetting):
-┌─────────────────────────────────────────────────────────────────────┐
-│ v2/v2.2 diagnosis:                                                    │
-│   Variance-only gate cannot distinguish "complex texture" (Urban100   │
-│   periodic patterns: high var + high gradient) from "natural edge"    │
-│   (Set14 edges: high gradient, moderate var). Single signal → gate    │
-│   makes identical decisions for fundamentally different content →     │
-│   seesaw. Also: L1 loss gradient dominated by low-freq → backbone    │
-│   gradually forgets HF textures after ~3K iters ("3K curse").        │
-│                                                                      │
-│ v2.3 fixes:                                                          │
-│   1. Gradient-Augmented Gate: concat [variance, gradient_magnitude]   │
-│      → 2C-channel input to gate network. Variance captures texture   │
-│      complexity; gradient captures edge strength. Two orthogonal     │
-│      signals let gate make finer decisions per content type.          │
-│   2. High-Frequency Residual Shortcut: hf = x - local_mean, added   │
-│      with per-channel learnable scale (init=0). Direct HF pathway    │
-│      bypasses the gate entirely → prevents catastrophic HF forgetting │
-│      regardless of L1 loss bias. Adapters: ~5.6K params each.        │
-│   3. Training: +FFTFreqLoss (weight=0.02) for explicit HF signal.    │
-│   Backward compatible: use_gradient_gate=False, use_hf_shortcut=     │
-│   False reverts to v2.1 behavior exactly.                            │
-└─────────────────────────────────────────────────────────────────────┘
+  这一版做了几处收缩：
+  1. 去掉 channel_mod，只保留方差门控的残差分支；
+  2. 主干全部解冻，但学习率压到 0.01x；
+  3. adapter 只放在 stage [1, 2]，不再放过早的 stage 0；
+  4. gate_init_bias 设为 -3.0，初始 sigmoid 大约 0.047；
+  5. adapter 更像是给主干微调提供内容相关的梯度调节，尽量避免单个数据集偏科。
 
-Architecture flow:
-  conv_first → [Layer 0] → [Layer 1] → Adapter₁
-             → [Layer 2] → Adapter₂ → [Layer 3]
-             → norm → patch_unembed → conv_after_body → +skip → upsample
+v2.3：
+  v2/v2.2 的问题是只有方差一个信号，很难区分“复杂纹理”和“自然边缘”。
+  比如 Urban100 的周期图案通常是高方差、高梯度；Set14 里的普通边缘则更像
+  高梯度、中等方差。只看方差时，gate 很容易对不同内容做出类似判断，结果就是
+  指标来回拉扯。另外，L1 的梯度偏低频，训练到 3K iter 左右后容易慢慢忘掉高频。
 
-v3.0 — SSGR (Spectral-Spatial Gated Refinement):
-┌─────────────────────────────────────────────────────────────────────┐
-│ Target: Avg PSNR +0.03-0.05, requiring deeper representation gains. │
-│                                                                      │
-│ v2.3 adapter fine-tuning ceiling is ~+0.005-0.015. To break through, │
-│ add a frequency-domain branch that directly enhances HF features:    │
-│                                                                      │
-│ SSGRAdapter = Spatial Branch (v2.3 VGR) + Spectral Branch (NEW):     │
-│   Spatial: gradient-augmented variance gate → content-aware refine   │
-│   Spectral: rfft2 → learnable magnitude modulation → irfft2         │
-│   Both branches zero-init, residual-added in parallel.               │
-│                                                                      │
-│ Why dual-domain works:                                               │
-│   - Spatial branch handles local details (edges, textures)           │
-│   - Spectral branch handles global frequency balance (sharpness,     │
-│     periodic patterns, HF energy distribution)                       │
-│   - Orthogonal optimization landscapes → compound rather than cancel │
-│                                                                      │
-│ Training: from-scratch 500K iters (backbone + adapters co-evolve).   │
-│ Params: ~7.5K per adapter × 3 positions = ~22.5K total (~3% of      │
-│ backbone). Cross-task: no SR/denoising-specific assumptions.          │
-└─────────────────────────────────────────────────────────────────────┘
+  这一版补了两点：
+  1. gate 输入改成 [variance, gradient_magnitude]，也就是 2C 通道；
+  2. 加高频残差捷径：hf = x - local_mean，再用逐通道可学习 scale 加回去，
+     scale 初始为 0。这样高频有一条绕过 gate 的通路，不完全依赖 L1 的优化信号。
 
-Architecture flow (SSGR, adapter_stages=[0,1,2]):
-  conv_first → [Layer 0] → Adapter₀ → [Layer 1] → Adapter₁
-             → [Layer 2] → Adapter₂ → [Layer 3]
-             → norm → patch_unembed → conv_after_body → +skip → upsample
+  配置上仍然兼容 v2.1：use_gradient_gate=False 且 use_hf_shortcut=False 时，
+  行为会退回到原来的方差门控版本。单个 adapter 大约 5.6K 参数。
 
-Cross-task: purely spatial/frequency domain, no SR/denoising-specific components.
+v2.3 结构：
+  conv_first -> [Layer 0] -> [Layer 1] -> Adapter1
+             -> [Layer 2] -> Adapter2 -> [Layer 3]
+             -> norm -> patch_unembed -> conv_after_body -> +skip -> upsample
+
+v3.0：SSGR（Spectral-Spatial Gated Refinement）
+  v2.3 的 adapter 微调收益比较有限，所以这里加了一个频域分支，直接调整高频特征。
+
+  SSGRAdapter = 空间分支（v2.3 VGR）+ 频域分支：
+  - 空间分支：梯度增强的方差 gate，用来处理局部边缘和纹理；
+  - 频域分支：rfft2 -> 可学习幅值调制 -> irfft2，用来调整体频率分布；
+  - 两个分支都按零初始化，以残差形式加回主特征。
+
+  训练设定是从头训练 500K iter，让主干和 adapter 一起适应。每个 adapter
+  大约 7.5K 参数，三个位置合计约 22.5K，约占主干 3%。这部分只依赖空间和
+  频率特征本身，没有写死 SR 或去噪任务的专用假设。
+
+SSGR 结构（adapter_stages=[0,1,2]）：
+  conv_first -> [Layer 0] -> Adapter0 -> [Layer 1] -> Adapter1
+             -> [Layer 2] -> Adapter2 -> [Layer 3]
+             -> norm -> patch_unembed -> conv_after_body -> +skip -> upsample
 """
 
 import os
